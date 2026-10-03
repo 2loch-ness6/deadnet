@@ -12,6 +12,7 @@ from typing import Union
 
 from concurrent.futures import ThreadPoolExecutor
 from utils import *
+from survival_monitor import SurvivalMonitor
 from android.permissions import request_permissions, Permission
 request_permissions([Permission.WRITE_EXTERNAL_STORAGE, Permission.INTERNET, Permission.ACCESS_WIFI_STATE,
                      Permission.ACCESS_NETWORK_STATE, Permission.ACCESS_FINE_LOCATION, Permission.CHANGE_WIFI_STATE])
@@ -38,12 +39,14 @@ class DeadNetAPK:
         "i386": "i386",
     }
 
-    def __init__(self, iface: str, gateway_ipv4: str, gateway_ipv6: str, gateway_mac: str, print_mtd: str):
+    def __init__(self, iface: str, gateway_ipv4: str, gateway_ipv6: str, gateway_mac: str, print_mtd,
+                 gauge_mtd=None):
         self._spoof_ipv6ra_interval = 5
         self._arp_sleep_attempt_interval = 0.075
         self._arp_sleep_cycle_interval = 10
         self._nra_sleep_interval = 2
         self._loop_sleep_interval = 0.321
+        self._survival_interval_ms = 500
 
         self._arp_bcast_proc: Union[None, subprocess.Popen] = None
         self._nra_proc: Union[None, subprocess.Popen] = None
@@ -51,6 +54,8 @@ class DeadNetAPK:
         self._network_interface = iface
 
         self.print_mtd = print_mtd
+        self.gauge_mtd = gauge_mtd
+        self._survival_monitor: Union[None, SurvivalMonitor] = None
         self._my_mac = get_device_mac_address_su(self._network_interface)
         if self._my_mac == NET_UNDEFINED:
             raise Exception("Failed to get device MAC address")
@@ -112,9 +117,12 @@ class DeadNetAPK:
             self.arp_path = os.path.join(internal_dir, f'arp.{arch_type}')
             nra_orig_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', f'nra.{arch_type}')
             self.nra_path = os.path.join(internal_dir, f'nra.{arch_type}')
+            sniff_orig_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', f'sniff.{arch_type}')
+            self.sniff_path = os.path.join(internal_dir, f'sniff.{arch_type}')
 
             for src_path, dest_path in [[arp_orig_path, self.arp_path],
-                                        [nra_orig_path, self.nra_path]]:
+                                        [nra_orig_path, self.nra_path],
+                                        [sniff_orig_path, self.sniff_path]]:
                 subprocess.run(f"su -c 'cp -rf {src_path} {dest_path}'", shell=True, check=True)
                 subprocess.run(f"su -c 'chmod 777 {dest_path}'", shell=True, check=True)
                 subprocess.run(f"su -c 'chown root {dest_path}'", shell=True, check=True)
@@ -176,9 +184,32 @@ class DeadNetAPK:
             except Exception as e:
                 Logger.error(f"{DEADNET_PREF}: Unable to kill {pid}: {e} - {traceback.format_exc()}")
 
+    def _start_survival_monitor(self) -> None:
+        if self.gauge_mtd is None:
+            return
+        try:
+            self._survival_monitor = SurvivalMonitor(
+                sniff_path=self.sniff_path,
+                iface=self._network_interface,
+                gateway_mac=self._gateway_mac,
+                our_mac=self._my_mac,
+                on_sample=self.gauge_mtd,
+                interval_ms=self._survival_interval_ms,
+            )
+            self._survival_monitor.start()
+        except Exception as e:
+            self._survival_monitor = None
+            Logger.error(f"{DEADNET_PREF}: failed to start survival monitor {e} - {traceback.format_exc()}")
+
+    def _stop_survival_monitor(self) -> None:
+        if self._survival_monitor is not None:
+            self._survival_monitor.stop()
+            self._survival_monitor = None
+
     def _start_attack_loop(self) -> None:
         self._ipv4_arp_bcast_attack()
         self._ipv6_nra_attack()
+        self._start_survival_monitor()
 
         start = time.time()
         while not self._abort:
@@ -189,6 +220,8 @@ class DeadNetAPK:
         self._terminate_all_attacks()
 
     def _terminate_all_attacks(self):
+        self._stop_survival_monitor()
+
         self._kill_proc(self._nra_proc, self.nra_path)
         self._nra_proc = None
 

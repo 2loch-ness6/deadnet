@@ -15,6 +15,21 @@ The APK is stored inside [bin](https://github.com/flashnuke/deadnet/tree/main/ap
 * Use the buttons - `Start`, `Stop` and `Refresh` (to refresh the current wifi connection info).
 * In case of an error, use the `Debug Logs` button to fetch the logs, and feel free to open a new [issue](https://github.com/flashnuke/deadnet/issues) with the debug logs included.
 
+### Live survival gauges
+While an attack is running, three live gauges show whether it is actually working, updated ~2x/second from a passive
+sniffer (`sniff.cpp`) that reads **only** Ethernet/IP/ARP header metadata on the interface - never packet payloads:
+
+* **ARP Tx** (left) - rate of ARP poison frames we are transmitting (our output).
+* **SURVIVING** (centre) - rate of packets still flowing to/from the *real* gateway MAC from other hosts. When this
+  drops to **0 p/s** the gauge reads **`DeadNet CONFIRMED`** - nothing is getting through. Any non-zero reading means
+  traffic (e.g. HTTPS/TLS on port 443) is still leaking past the attack.
+* **ARP Rx + evidence** (right) - ARP chatter we receive plus frames other hosts are sending to dead/spoofed MACs,
+  i.e. evidence their ARP caches are poisoned the way we want.
+
+> **Note on Wi-Fi visibility:** on an encrypted managed Wi-Fi network a client cannot see other stations' unicast
+> frames (each station has its own pairwise key), so the SURVIVING gauge mainly reflects broadcast/multicast and
+> gateway-visible traffic. It is most accurate on open networks, hotspots, or wired links. The ARP gauges always work.
+
 ### Permissions
 * Some parts were compiled into native binaries due to a lack of permissions that restrict the Python interpreter from directly creating raw sockets, even when running as root.
 * `ACCESS_FINE_LOCATION` permission is required in order to access SSID data (i.e. wifi network name).
@@ -51,6 +66,11 @@ $NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clan
 $NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi29-clang++ -static -o assets/arp.arm src/arp.cpp
 $NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/i686-linux-android29-clang++ -static -o assets/arp.x86 src/arp.cpp
 $NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android29-clang++ -static -o assets/arp.x86_64 src/arp.cpp
+
+$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang++ -static -O2 -o assets/sniff.arm64 src/sniff.cpp
+$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi29-clang++ -static -O2 -o assets/sniff.arm src/sniff.cpp
+$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/i686-linux-android29-clang++ -static -O2 -o assets/sniff.x86 src/sniff.cpp
+$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android29-clang++ -static -O2 -o assets/sniff.x86_64 src/sniff.cpp
 ```
 
 The compiled binaries will be stored under `./assets`.
