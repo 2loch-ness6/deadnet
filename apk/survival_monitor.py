@@ -25,7 +25,8 @@ from utils import DEADNET_PREF
 
 
 class SurvivalSample:
-    __slots__ = ("arp_tx_ps", "arp_rx_ps", "surv_ps", "surv_bytes_ps", "evid_ps", "total_ps", "confirmed")
+    __slots__ = ("arp_tx_ps", "arp_rx_ps", "surv_ps", "surv_bytes_ps", "evid_ps", "total_ps",
+                 "evidence_ps", "confirmed")
 
     def __init__(self, arp_tx_ps, arp_rx_ps, surv_ps, surv_bytes_ps, evid_ps, total_ps):
         self.arp_tx_ps = arp_tx_ps
