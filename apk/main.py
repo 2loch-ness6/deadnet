@@ -5,6 +5,8 @@ import traceback
 
 from utils import *
 from deadnet_apk import DeadNetAPK
+from gauge import Gauge  # noqa: F401  (registers the <Gauge> widget for main.kv)
+from survival_monitor import SurvivalSample
 from kivy.app import App
 from kivymd.toast.kivytoast import toast
 from kivymd.app import MDApp
@@ -35,6 +37,9 @@ class MainApp(MDApp):
         self._abort_lck = threading.RLock()
         self._deadnet_thread: Union[None, threading.Thread] = None
         self._deadnet_instance: Union[None, DeadNetAPK] = None
+
+        # rolling peaks for auto-ranging the gauge dials (so the needle uses most of the sweep)
+        self._gauge_peaks = {"tx": 1.0, "surv": 1.0, "evid": 1.0}
 
         self._root_status = self._try_root()
 
@@ -127,6 +132,7 @@ class MainApp(MDApp):
                     self._deadnet_thread.join()
                 self._toast_msg("Stopped deadnet")
                 self._deadnet_instance = None
+                self._reset_gauges()
             else:
                 self._toast_msg("Deadnet is not running")
 
@@ -198,7 +204,7 @@ class MainApp(MDApp):
             try:
                 self._deadnet_instance = DeadNetAPK(self._IFACE,
                                                     self._GATEWAY_IPV4, self._GATEWAY_IPV6, self._GATEWAY_HWDDR,
-                                                    self.printf)
+                                                    self.printf, self.update_gauges)
             except Exception as e:
                 Logger.error(f"{DEADNET_PREF}: Exception {e} when starting attack, traceback: {traceback.format_exc()}")
                 self.printf(f"error during setup -> {e}")
@@ -221,6 +227,62 @@ class MainApp(MDApp):
         self.root.ids.output_label.text = text
         if fit_size:
             self.root.ids.output_label.text_size = self.root.ids.output_label.size
+
+    def update_gauges(self, sample: SurvivalSample) -> None:
+        # called from the monitor's reader thread -> marshal onto the UI thread
+        Clock.schedule_once(lambda dt: self._apply_sample(sample))
+
+    def _auto_max(self, key: str, value: float, floor: float) -> float:
+        # slowly decay the peak so the dial re-scales down when traffic drops, but never below a sane floor
+        peak = max(value, self._gauge_peaks[key] * 0.9, floor)
+        self._gauge_peaks[key] = peak
+        return peak
+
+    def _apply_sample(self, sample: SurvivalSample) -> None:
+        if self.root is None:
+            return
+
+        # left: ARP transmit rate (our poison output)
+        tx = self.root.ids.cell_tx
+        tx.gauge_value = sample.arp_tx_ps
+        tx.gauge_max = self._auto_max("tx", sample.arp_tx_ps, 20.0)
+        tx.big_text = str(int(round(sample.arp_tx_ps)))
+
+        # centre: surviving traffic to/from the real gateway -> 0 means the network is dead
+        surv = self.root.ids.cell_surv
+        surv.gauge_value = sample.surv_ps
+        surv.gauge_max = self._auto_max("surv", sample.surv_ps, 20.0)
+        if sample.confirmed:
+            surv.arc_rgba = [0.07, 0.69, 0.07, 1]   # green
+            surv.big_rgba = [0.07, 0.69, 0.07, 1]
+            surv.big_text = '0'
+            surv.caption_text = '[b]DeadNet CONFIRMED[/b]'
+        else:
+            surv.arc_rgba = [0.82, 0.11, 0.11, 1]   # red: traffic is leaking through
+            surv.big_rgba = [0.82, 0.11, 0.11, 1]
+            surv.big_text = str(int(round(sample.surv_ps)))
+            surv.caption_text = 'pkt/s leaking'
+
+        # right: ARP chatter we receive + frames to dead/spoofed MACs (caches poisoned our way)
+        evid = self.root.ids.cell_evid
+        evid.gauge_value = sample.evidence_ps
+        evid.gauge_max = self._auto_max("evid", sample.evidence_ps, 20.0)
+        evid.big_text = str(int(round(sample.evidence_ps)))
+
+    def _reset_gauges(self) -> None:
+        if self.root is None:
+            return
+        self._gauge_peaks = {"tx": 1.0, "surv": 1.0, "evid": 1.0}
+        for cid in ("cell_tx", "cell_evid"):
+            cell = self.root.ids[cid]
+            cell.gauge_value = 0
+            cell.big_text = '0'
+        surv = self.root.ids.cell_surv
+        surv.gauge_value = 0
+        surv.arc_rgba = [0.07, 0.69, 0.07, 1]
+        surv.big_rgba = [0.07, 0.69, 0.07, 1]
+        surv.big_text = '--'
+        surv.caption_text = 'idle'
 
     def on_start(self) -> None:
         # on app start
