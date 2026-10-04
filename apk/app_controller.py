@@ -88,6 +88,8 @@ class AppController:
         self._emission = None
         self._rsm = None
         self._bird = None
+        self._survival = None            # SurvivalMonitor (feeds the live gauges)
+        self._survival_sample = None     # latest SurvivalSample
 
         self._lock = threading.RLock()
 
@@ -355,19 +357,31 @@ class AppController:
             if self.mode != Mode.LOCKED:
                 self.emit("error", msg="FIRE requires Lock & Level (associate first)")
                 return False
-            focused = len(self.selected()) > 0
-            self.knobs.emit_mode = EmitMode.FOCUSED if focused else EmitMode.UNFOCUSED
-
             from engine.emission import EmissionController
             from engine.birdobserver import BirdObserver
 
+            # emit.cpp only transmits at focus entries, so give it targets:
+            # the smelled hosts on the connected subnet (+ the gateway). Manual
+            # station picks, if any, are kept. Without this FIRE sends nothing.
+            n_targets = self._seed_targets()
+            focused = n_targets > 0
+            self.knobs.emit_mode = EmitMode.FOCUSED if focused else EmitMode.UNFOCUSED
+            if n_targets == 0:
+                self.emit("error", msg="no targets smelled yet — scan the subnet first")
+            our_mac = self._iface_mac(self.managed_iface)
             self._emission = EmissionController(self.arbiter, self.appdir, self.knobs)
-            self._emission.add_transmitter(self.managed_iface, self.net)
+            self._emission.add_transmitter(self.managed_iface, self.net, our_mac=our_mac)
             self._emission.start()  # also starts its own 100 ms rehydrator
 
             # feed the sniffer-sourced escaped-envelope counts into that rehydrator
             if on_stats is not None and getattr(self._emission, "_rehydrator", None):
                 self._emission._rehydrator.set_escaped_source(on_stats)
+
+            # Live gauges: the native `sniff` binary on the associated link counts
+            # our ARP TX, surviving (leaked) packets and dead-MAC evidence — the
+            # proven survival-gauges feed. It measures the aggregate regardless of
+            # focus set, so the gauges work in focused AND unfocused fire.
+            self._start_survival(our_mac)
 
             if self.knobs.bird_airborne:
                 self._bird = BirdObserver(self.arbiter, self.knobs)
@@ -379,9 +393,17 @@ class AppController:
             return True
 
     def state_metrics(self) -> dict:
-        """Aggregate DB_STATE for the §3 gauges (polled on a Clock tick):
-        total tx pkt/s we emit, total leaking pkt/s, and a CONFIRMED flag
-        (nothing leaking across all tracked targets)."""
+        """Metrics for the §3 gauges (polled on a Clock tick). Preferred source
+        is the live SurvivalMonitor sample (our ARP TX / surviving-leaks /
+        evidence off the associated link); falls back to the DB_STATE rollup
+        (emit.cpp native per-target stats) when no survival sample is in yet."""
+        s = self._survival_sample
+        if s is not None:
+            leaking = s.surv_ps
+            return {"tx_ps": s.arp_tx_ps, "leaking": leaking,
+                    "evidence": s.evidence_ps,
+                    "confirmed": bool(s.confirmed) and self.mode == Mode.FIRING,
+                    "targets": len(self.selected())}
         rows = self.arbiter.read(
             DB_STATE, "SELECT tx_pps, escaped_pkts, compliant FROM metrics")
         tx = sum((r[0] or 0.0) for r in rows)
@@ -391,9 +413,89 @@ class AppController:
         return {"tx_ps": tx, "leaking": leaking, "evidence": evidence,
                 "confirmed": confirmed, "targets": len(rows)}
 
+    def _seed_targets(self) -> int:
+        """Fill the attention/focus set from the hosts smelled on the connected
+        subnet (ARP sweep => each has a real MAC) plus the gateway, so emit.cpp
+        has something to aim at. Skips our own device. Keeps any manual picks.
+        Returns the number of victim targets (excludes the gateway)."""
+        if self.net is None:
+            return 0
+        net_id = self.net.subnet_cidr or self.net.iface
+        our_ip = self.net.device_ip or ""
+        gw_ip = self.net.gateway_ipv4 or ""
+        gw_mac = self.net.gateway_mac or ""
+        # gateway: present so emit can recover gw IPv4 (victim-side poison);
+        # pinned + marked so we can tell it apart — emit never victimizes it.
+        if gw_mac and gw_ip:
+            self.arbiter.write(
+                DB_ATTENTION,
+                "INSERT OR REPLACE INTO attention(mac, ip, net_id, weight, pinned) "
+                "VALUES(?,?,?,?,1)", (gw_mac, gw_ip, net_id, 1.0))
+        victims = 0
+        rows = self.arbiter.read(
+            DB_KNOWN_SCENTS,
+            "SELECT mac, ip FROM scents WHERE mac != '' AND ip != ''")
+        for mac, ip in rows:
+            if ip in (our_ip, gw_ip) or mac == gw_mac:
+                continue
+            self.arbiter.write_async(
+                DB_ATTENTION,
+                "INSERT OR IGNORE INTO attention(mac, ip, net_id, weight, pinned) "
+                "VALUES(?,?,?,1.0,0)", (mac, ip, net_id))
+            victims += 1
+        return victims
+
+    # -- live-gauge survival monitor ----------------------------------------
+    def _iface_mac(self, iface: str) -> str:
+        try:
+            import subprocess
+            cp = subprocess.run(
+                ["su", "-c", f"cat /sys/class/net/{iface}/address"],
+                capture_output=True, text=True, timeout=5)
+            return (cp.stdout or "").strip()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _copy_sniff(self) -> Optional[str]:
+        """Copy sniff.<arch> into appdir (root-owned, +x), mirroring emission's
+        binary prep. Returns the on-device path, or None if unavailable."""
+        try:
+            import os
+            import subprocess
+            from engine.emission import _arch_suffix
+            # assets live beside this file (apk/assets), not under appdir
+            here = os.path.dirname(os.path.abspath(__file__))
+            src = os.path.join(here, "assets", f"sniff.{_arch_suffix()}")
+            dst = os.path.join(self.appdir, f"sniff.{_arch_suffix()}")
+            subprocess.run(f"su -c 'cp -rf {src} {dst}'", shell=True, check=True)
+            subprocess.run(f"su -c 'chmod 777 {dst}'", shell=True, check=True)
+            subprocess.run(f"su -c 'chown root {dst}'", shell=True, check=True)
+            return dst
+        except Exception as exc:  # noqa: BLE001
+            Logger.error(f"{DEADNET_PREF}: sniff copy failed {exc}")
+            return None
+
+    def _on_survival(self, sample) -> None:
+        self._survival_sample = sample
+
+    def _start_survival(self, our_mac: str) -> None:
+        try:
+            from survival_monitor import SurvivalMonitor
+        except Exception as exc:  # noqa: BLE001
+            Logger.error(f"{DEADNET_PREF}: SurvivalMonitor import failed {exc}")
+            return
+        sniff = self._copy_sniff()
+        if not sniff:
+            return
+        gw = (self.net.gateway_mac if self.net else "") or ""
+        self._survival_sample = None
+        self._survival = SurvivalMonitor(
+            sniff, self.managed_iface, gw, our_mac, on_sample=self._on_survival)
+        self._survival.start()
+
     def cease(self) -> None:
         with self._lock:
-            for svc in ("_bird", "_rsm", "_emission"):
+            for svc in ("_bird", "_rsm", "_emission", "_survival"):
                 obj = getattr(self, svc, None)
                 if obj is not None:
                     try:
@@ -401,6 +503,7 @@ class AppController:
                     except Exception:  # noqa: BLE001
                         pass
                     setattr(self, svc, None)
+            self._survival_sample = None
             if self.mode == Mode.FIRING:
                 self.mode = Mode.LOCKED
                 self.emit("mode", mode=self.mode.value, preset=self.preset.value)

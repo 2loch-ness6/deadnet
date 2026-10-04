@@ -160,8 +160,10 @@ class MainApp(MDApp):
             ssid = r.get("ssid") or "(hidden)"
             txt = (f"[b]{ssid}[/b]\n[size=19]{bssid}   ch{r.get('channel',0)}   "
                    f"{r.get('signal_dbm',0)}dBm[/size]")
-            row = Factory.RouterRow(text=txt, bssid=bssid,
-                                    size_hint_y=None, height=84)
+            # NB: `bssid` is a kv-declared property — it can't be passed to
+            # __init__ (EventDispatcher rejects unknown ctor kwargs); set it after.
+            row = Factory.RouterRow(text=txt, size_hint_y=None, height=84)
+            row.bssid = bssid
             row.state = "down" if bssid in selected else "normal"
             row.bind(on_press=lambda w, b=bssid: self._toggle_router(b, w))
             lst.add_widget(row)
