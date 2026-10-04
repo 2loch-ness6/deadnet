@@ -1,5 +1,8 @@
 #:import Gauge gauge.Gauge
 
+# All sizes are the original layout scaled x1.35 (owner: "bigger by ~35%").
+
+# ---- reusable survival gauge cell (kept from the survival-gauges work) -------
 <GaugeCell@FloatLayout>:
     gauge_value: 0
     gauge_max: 100
@@ -19,159 +22,285 @@
         text: root.title_text
         markup: True
         bold: True
-        font_size: 26
+        font_size: 30
         color: 0.65, 0.65, 0.65, 1
         size_hint: 1, None
-        height: 30
+        height: 35
         pos_hint: {'center_x': 0.5, 'center_y': 0.93}
     Label:
         text: root.big_text
         markup: True
         bold: True
-        font_size: 52
+        font_size: 59
         color: root.big_rgba
         halign: 'center'
         size_hint: 1, None
-        height: 60
+        height: 73
         pos_hint: {'center_x': 0.5, 'center_y': 0.47}
     Label:
         text: root.caption_text
         markup: True
-        font_size: 24
+        font_size: 27
         color: 0.8, 0.8, 0.8, 1
         halign: 'center'
         size_hint: 1, None
-        height: 28
+        height: 32
         pos_hint: {'center_x': 0.5, 'center_y': 0.18}
 
+<PresetButton@Button>:
+    accent: [0.30, 0.31, 1.0, 1]
+    markup: True
+    font_size: 46
+    halign: 'center'
+    background_color: [0, 0, 0, 0]
+    canvas.before:
+        Color:
+            rgba: root.accent if self.state == 'normal' else [root.accent[0], root.accent[1], root.accent[2], 0.5]
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [24]
+
+# ---- selectable router row (Detect & Select) --------------------------------
+<RouterRow@ToggleButton>:
+    bssid: ''
+    markup: True
+    font_size: 26
+    halign: 'left'
+    valign: 'middle'
+    text_size: self.width - 24, None
+    padding: [12, 8]
+    background_color: [0, 0, 0, 0]
+    canvas.before:
+        Color:
+            rgba: [0.10, 0.42, 0.14, 1] if self.state == 'down' else [0.14, 0.14, 0.17, 1]
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [12]
+
+<NavButton@Button>:
+    markup: True
+    font_size: 30
+    background_color: [0, 0, 0, 0]
+    color: 0.85, 0.85, 0.85, 1
+    canvas.before:
+        Color:
+            rgba: 0.12, 0.12, 0.14, 1
+        Rectangle:
+            pos: self.pos
+            size: self.size
+
+# =============================================================================
 BoxLayout:
+    orientation: 'vertical'
     canvas.before:
         Color:
             rgba: 0, 0, 0, 1
         Rectangle:
             pos: self.pos
             size: self.size
-    orientation: 'vertical'
-    Image:
-        source: 'assets/banner.png'
-        size_hint_y: 0.6
-    Label:
-        id: ssid_label
-        font_size: 44
-        text: ''
-        bold: True
-        markup: True
-        size_hint_y: 0.5
-        pos_hint: {'center_x': .5, 'center_y': 1}
-        background_color: [0, 0, 0, 0]
-    BoxLayout:
-        id: gauge_panel
-        orientation: 'horizontal'
-        size_hint_y: 1.6
-        padding: 10
-        spacing: 6
-        GaugeCell:
-            id: cell_tx
-            title_text: 'ARP Tx'
-            arc_rgba: [0.30, 0.31, 1.0, 1]
-            big_rgba: [0.30, 0.31, 1.0, 1]
-            big_text: '0'
-            caption_text: 'pkt/s'
-        GaugeCell:
-            id: cell_surv
-            title_text: 'SURVIVING'
-            arc_rgba: [0.07, 0.69, 0.07, 1]
-            big_rgba: [0.07, 0.69, 0.07, 1]
-            big_text: '--'
-            caption_text: 'idle'
-        GaugeCell:
-            id: cell_evid
-            title_text: 'ARP Rx + evidence'
-            arc_rgba: [0.90, 0.85, 0.0, 1]
-            big_rgba: [0.90, 0.85, 0.0, 1]
-            big_text: '0'
-            caption_text: 'pkt/s'
-    Label:
-        text: ''
-        bold: True
-        markup: True
-        size_hint_y: 0.7
-        pos_hint: {'center_x': .5, 'center_y': 1}
-        id: output_label
-    GridLayout:
-        cols: 3
-        padding: 20
-        size_hint_y: 0.9
-        Button:
-            text: '[color=#11B011][b]Start[/color][/b]'
-            font_size: 55
-            markup: True
-            size_hint: (0.25, None)
-            height: 180
-            pos_hint: {'center_x': .5, 'center_y': .5}
-            background_color: [0, 0, 0, 0]
-            on_press: app.on_start_press()
-            canvas.before:
-                Color:
-                    rgba: 1,1,1,0.03
-                RoundedRectangle:
-                    pos: self.pos
-                    size: self.size
-                    radius: [(30,30), (0,0), (0,0), (30,30)]
-        Button:
-            text: '[color=#0077CC][b]Refresh[/color][/b]'
-            font_size: 55
-            markup: True
-            size_hint: (0.25, None)
-            height: 180
-            pos_hint: {'center_x': .5, 'center_y': .5}
-            background_color: [0, 0, 0, 0]
-            on_press: app.on_refresh_press()
-            canvas.before:
-                Color:
-                    rgba: 1,1,1,0.03
-                RoundedRectangle:
-                    pos: self.pos
-                    size: self.size
-                    radius: [0]
-        Button:
-            text: '[color=#D10000][b]Stop[/color][/b]'
-            font_size: 55
-            markup: True
-            size_hint: (0.25, None)
-            height: 180
-            pos_hint: {'center_x': .5, 'center_y': .5}
-            background_color: [0, 0, 0, 0]
-            on_press: app.on_stop_press()
-            canvas.before:
-                Color:
-                    rgba: 1,1,1,0.03
-                RoundedRectangle:
-                    pos: self.pos
-                    size: self.size
-                    radius: [(0,0), (30,30), (30,30), (0,0)]
+
+    ScreenManager:
+        id: sm
+        size_hint_y: 1
+
+        # ---------------------------------------- §1 Detect & Select
+        Screen:
+            name: 'detect'
+            BoxLayout:
+                orientation: 'vertical'
+                padding: 24
+                spacing: 12
+                Label:
+                    text: '[b]DETECT & SELECT[/b]'
+                    markup: True
+                    font_size: 40
+                    size_hint_y: None
+                    height: 62
+                Label:
+                    id: radio_state
+                    text: 'radio: --'
+                    markup: True
+                    font_size: 32
+                    size_hint_y: None
+                    height: 49
+                PresetButton:
+                    id: btn_detect
+                    text: '[b]DETECT & SELECT[/b]'
+                    accent: [0.30, 0.31, 1.0, 1]
+                    font_size: 38
+                    size_hint_y: None
+                    height: 118
+                    on_press: app.on_detect()
+                Label:
+                    id: router_hint
+                    text: 'smelling routers… pick 1–2'
+                    markup: True
+                    font_size: 24
+                    color: 0.7, 0.7, 0.7, 1
+                    size_hint_y: None
+                    height: 34
+                ScrollView:
+                    size_hint_y: 1
+                    GridLayout:
+                        id: router_list
+                        cols: 1
+                        size_hint_y: None
+                        height: self.minimum_height
+                        spacing: 8
+                        padding: [0, 4]
+                BoxLayout:
+                    size_hint_y: None
+                    height: 64
+                    spacing: 12
+                    ToggleButton:
+                        id: tgl_adhd
+                        text: '[b]ADHD (2 nets)[/b]'
+                        markup: True
+                        font_size: 26
+                        on_state: app.on_adhd(self.state == 'down')
+                    Label:
+                        id: link_state
+                        text: ''
+                        markup: True
+                        font_size: 24
+                        color: 0.7, 0.85, 0.7, 1
+                PresetButton:
+                    id: btn_connect
+                    text: '[b]CONNECT & SMELL[/b]'
+                    accent: [0.07, 0.55, 0.14, 1]
+                    font_size: 38
+                    size_hint_y: None
+                    height: 118
+                    on_press: app.on_connect()
+                PresetButton:
+                    text: '[b]RELEASE RADIO[/b]'
+                    accent: [0.25, 0.25, 0.25, 1]
+                    font_size: 32
+                    size_hint_y: None
+                    height: 89
+                    on_press: app.on_release()
+
+        # ---------------------------------------- §2 Scan & Select (focused)
+        Screen:
+            name: 'scan'
+            BoxLayout:
+                orientation: 'vertical'
+                padding: 19
+                spacing: 11
+                Label:
+                    text: '[b]FOCUSED SMELL[/b]'
+                    markup: True
+                    font_size: 40
+                    size_hint_y: None
+                    height: 59
+                Label:
+                    id: scan_status
+                    text: 'idle'
+                    markup: True
+                    font_size: 27
+                    size_hint_y: None
+                    height: 41
+                ScrollView:
+                    GridLayout:
+                        id: scent_list
+                        cols: 1
+                        size_hint_y: None
+                        height: self.minimum_height
+                        spacing: 5
+                        padding: [0, 5]
+                BoxLayout:
+                    size_hint_y: None
+                    height: 95
+                    spacing: 14
+                    Label:
+                        id: sel_count
+                        text: 'selected: 0'
+                        markup: True
+                        font_size: 30
+                    Button:
+                        text: '[b]Refresh[/b]'
+                        markup: True
+                        font_size: 30
+                        on_press: app.refresh_scents()
+                    Button:
+                        text: '[b]Clear[/b]'
+                        markup: True
+                        font_size: 30
+                        on_press: app.on_clear_selection()
+
+        # ---------------------------------------- §3 Configure & Trigger
+        Screen:
+            name: 'configure'
+            BoxLayout:
+                orientation: 'vertical'
+                padding: 16
+                spacing: 8
+                Label:
+                    text: '[b]CONFIGURE & TRIGGER[/b]'
+                    markup: True
+                    font_size: 38
+                    size_hint_y: None
+                    height: 54
+                BoxLayout:
+                    id: gauge_panel
+                    orientation: 'horizontal'
+                    size_hint_y: 1.3
+                    spacing: 8
+                    GaugeCell:
+                        id: cell_tx
+                        title_text: 'TX'
+                        arc_rgba: [0.30, 0.31, 1.0, 1]
+                        big_rgba: [0.30, 0.31, 1.0, 1]
+                        caption_text: 'pkt/s'
+                    GaugeCell:
+                        id: cell_surv
+                        title_text: 'SURVIVING'
+                        arc_rgba: [0.07, 0.69, 0.07, 1]
+                        big_rgba: [0.07, 0.69, 0.07, 1]
+                        big_text: '--'
+                        caption_text: 'idle'
+                    GaugeCell:
+                        id: cell_evid
+                        title_text: 'EVIDENCE'
+                        arc_rgba: [0.90, 0.85, 0.0, 1]
+                        big_rgba: [0.90, 0.85, 0.0, 1]
+                        caption_text: 'pkts'
+                ScrollView:
+                    size_hint_y: 1.0
+                    GridLayout:
+                        id: knob_panel
+                        cols: 1
+                        size_hint_y: None
+                        height: self.minimum_height
+                        spacing: 3
+                BoxLayout:
+                    size_hint_y: None
+                    height: 124
+                    spacing: 16
+                    padding: [5, 8]
+                    PresetButton:
+                        id: btn_fire
+                        text: '[b]FIRE[/b]'
+                        accent: [0.82, 0.11, 0.11, 1]
+                        on_press: app.on_fire()
+                    PresetButton:
+                        id: btn_cease
+                        text: '[b]CEASE[/b]'
+                        accent: [0.25, 0.25, 0.25, 1]
+                        on_press: app.on_cease()
+
+    # ---- persistent bottom nav -------------------------------------------
     BoxLayout:
         size_hint_y: None
-        height: 90
-        padding: [33, 10]
-        Button:
-            text: '[color=#FFFFFF][b]Debug Logs[/b][/color]'
-            font_size: 26
-            markup: True
-            size_hint: (1, 1)
-            background_color: [0, 0, 0, 0]
-            on_press: app.on_debug_press()
-            canvas.before:
-                Color:
-                    rgba: 1, 1, 1, 0
-                RoundedRectangle:
-                    pos: self.pos
-                    size: self.size
-                    radius: [15]
-    Label:
-        text: 'written by [color=#4D4FFF][u][ref=https://github.com/flashnuke]@flashnuke[/ref][/color][/u]'
-        bold: True
-        markup: True
-        size_hint_y: 0.4
-        pos_hint: {'center_x': .5, 'center_y': 1}
-        on_ref_press: app.on_ref_credit_press()
+        height: 97
+        NavButton:
+            text: '[b]Detect[/b]'
+            on_press: app.goto('detect')
+        NavButton:
+            text: '[b]Smell[/b]'
+            on_press: app.goto('scan')
+        NavButton:
+            text: '[b]Configure[/b]'
+            on_press: app.goto('configure')

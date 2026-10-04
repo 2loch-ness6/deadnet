@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+apk/magisk/dist/
+apk/magisk/extra_bin/

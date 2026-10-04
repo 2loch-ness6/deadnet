@@ -1,0 +1,6 @@
+id=deadnet
+name=DeadNet Tools
+version=v0.1.0
+versionCode=1
+author=2loch-ness6
+description=Systemless delivery of DeadNet native engines (emit/sniff/synscan) and, when available, association tools (wpa_supplicant/udhcpc) into /system/bin so the app runs fully in the Android namespace (no chroot).
