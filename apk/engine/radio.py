@@ -126,6 +126,11 @@ class RadioController:
         """Return the associated BSSID (lowercase) or None."""
         return parse_link(_su(f"iw dev {self.managed_iface} link").stdout)
 
+    def link_bssid(self, iface: str) -> Optional[str]:
+        """Associated BSSID (lowercase) for any iface, or None — used to read the
+        2nd STA (wlan1) airspace when the framework has raised it."""
+        return parse_link(_su(f"iw dev {iface} link").stdout)
+
     def current_ssid(self) -> str:
         """SSID wlan0 is currently associated to (via `cmd wifi status`), or ''."""
         out = _su("cmd wifi status").stdout or ""
@@ -283,20 +288,27 @@ class RadioController:
         """Tear down monitor and hand the radio back to Android. PROVEN + idempotent."""
         with self._lock:
             self.stop_hopping()
+            # Did we actually seize the radio into monitor? Only then must we
+            # toggle Wi-Fi to force re-association. In the associate-first flow we
+            # never leave MANAGED, so we skip the toggle and keep adb/tailscale on
+            # wlan0 alive — "leave it how it was found" without the disruption.
+            was_seized = self.state in (CardState.MONITOR, CardState.SEIZING)
             if self.state not in (CardState.ERROR, CardState.ANDROID):
                 self.state = CardState.RELEASING
             _su(f"iw dev {self.mon_iface} del")
             _su(f"ip link set {self.managed_iface} up")
-            # Force a disable->enable toggle: after recon the framework can still
-            # read wifi_on=1, so a bare `svc wifi enable` is a no-op and wlan0 never
-            # re-associates. Toggling guarantees the framework re-kicks association.
-            # (Proven on-device: bare enable left wlan0 "Not connected"; toggle fixed it.)
-            _su("svc wifi disable")
-            _su("svc wifi enable")
+            if was_seized:
+                # Force a disable->enable toggle: after recon the framework can still
+                # read wifi_on=1, so a bare `svc wifi enable` is a no-op and wlan0 never
+                # re-associates. Toggling guarantees the framework re-kicks association.
+                # (Proven on-device: bare enable left wlan0 "Not connected"; toggle fixed it.)
+                _su("svc wifi disable")
+                _su("svc wifi enable")
             # put the OEM dual-STA / multi-internet knobs back how we found them
             self.restore_baseline()
             self.state = CardState.ANDROID
-            Logger.info(f"{DEADNET_PREF}: radio released to Android")
+            Logger.info(f"{DEADNET_PREF}: radio released to Android "
+                        f"(wifi toggle={'yes' if was_seized else 'no'})")
         if not wait_reconnect:
             return True
         return self.wait_associated(timeout_s)

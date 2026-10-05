@@ -94,14 +94,16 @@ class MainApp(MDApp):
         elif kind == "mode":
             self._refresh_detect()
             self._toast(f"{data.get('preset','')} / {data.get('mode','')}")
-        elif kind == "detecting":
-            self.root.ids.router_hint.text = "smelling routers… pick 1–2"
-        elif kind == "ap_selected":
-            self._refresh_detect()
-        elif kind == "connected":
+        elif kind == "detected":
+            self._render_airspaces(data.get("airspaces", []))
+            n = len(data.get("airspaces", []))
+            self.root.ids.detect_hint.text = (
+                f"associated to {n} airspace(s) — Smell to sweep"
+                if n else "not associated — join a Wi-Fi you own in Android settings")
+        elif kind == "smelling":
             self._refresh_detect()
             links = data.get("links", {})
-            self._toast(f"connected: {links.get('mode','')}")
+            self._toast(f"smelling: {links.get('mode','')}")
             self.goto("scan")
         elif kind == "scan":
             self.root.ids.scan_status.text = (
@@ -112,25 +114,21 @@ class MainApp(MDApp):
         elif kind in ("selected", "deselected", "selection_cleared"):
             self._refresh_sel_count()
 
-    # -- §1 Detect & Select -------------------------------------------------
+    # -- §1 Detect (associated airspaces) -----------------------------------
     def on_detect(self):
-        """Seize the radio into monitor and smell routers across both bands."""
-        self._run(lambda: self.ctl.detect_and_select(hop_both_bands=True),
-                  "seizing radio — smelling routers…")
+        """Read which Wi-Fi airspace(s) the phone is already joined to. No seize."""
+        self._run(lambda: self.ctl.detect(), "reading associated airspaces…")
 
     def on_adhd(self, on: bool):
         if self.ctl is not None:
             self.ctl.adhd = bool(on)
 
     def on_connect(self):
-        """Release monitor, associate, scope focused smelling to the subnet."""
+        """Stay associated; sweep the associated subnet into known_scents."""
         if self.ctl is None:
             return
-        if not self.ctl.target_aps:
-            self._toast("pick 1–2 routers first")
-            return
-        self._run(lambda: self.ctl.connect(adhd=self.ctl.adhd),
-                  "connecting + focused smelling…")
+        self._run(lambda: self.ctl.begin_smell(adhd=self.ctl.adhd),
+                  "smelling the airspace…")
 
     def on_release(self):
         self._run(lambda: self.ctl.release(), "releasing radio to Android…")
@@ -148,45 +146,25 @@ class MainApp(MDApp):
             self.root.ids.link_state.text = (
                 f"[b]{links.get('mode','')}[/b]  {w0.get('ssid','')}{extra}")
         else:
-            n = len(self.ctl.target_aps)
-            self.root.ids.link_state.text = f"targets: {n}/2" if n else ""
+            n = len(getattr(self.ctl, "airspaces_list", []) or [])
+            self.root.ids.link_state.text = f"airspaces: {n}" if n else ""
 
-    def _render_routers(self, routers, selected):
-        lst = self.root.ids.router_list
+    def _render_airspaces(self, airspaces):
+        """Show the airspace(s) we're associated to (read-only — the scope)."""
+        lst = self.root.ids.airspace_list
         lst.clear_widgets()
-        from kivy.factory import Factory
-        for r in routers[:60]:
-            bssid = r.get("mac", "")
-            ssid = r.get("ssid") or "(hidden)"
-            txt = (f"[b]{ssid}[/b]\n[size=19]{bssid}   ch{r.get('channel',0)}   "
-                   f"{r.get('signal_dbm',0)}dBm[/size]")
-            # NB: `bssid` is a kv-declared property — it can't be passed to
-            # __init__ (EventDispatcher rejects unknown ctor kwargs); set it after.
-            row = Factory.RouterRow(text=txt, size_hint_y=None, height=84)
-            row.bssid = bssid
-            row.state = "down" if bssid in selected else "normal"
-            row.bind(on_press=lambda w, b=bssid: self._toggle_router(b, w))
-            lst.add_widget(row)
-
-    def _toggle_router(self, bssid, widget):
-        if self.ctl is None:
+        if not airspaces:
+            lst.add_widget(self._info_label(
+                "no association — join a Wi-Fi you own, then Detect"))
             return
-        if widget.state == "down":
-            if not self.ctl.select_ap(bssid):
-                widget.state = "normal"      # refused (cap of 2)
-        else:
-            self.ctl.deselect_ap(bssid)
-        self._refresh_detect()
-
-    def _refresh_routers(self):
-        if self.ctl is None or self.root is None:
-            return
-        try:
-            routers = self.ctl.routers()
-        except Exception as exc:  # noqa: BLE001
-            Logger.error(f"{DEADNET_PREF}: router read {exc}")
-            return
-        self._render_routers(routers, set(self.ctl.target_aps))
+        for a in airspaces:
+            ssid = a.get("ssid") or "(unknown SSID)"
+            txt = (f"[b]{ssid}[/b]\n[size=19]{a.get('iface','')}   "
+                   f"{a.get('bssid','') or '—'}[/size]")
+            lab = Label(text=txt, markup=True, font_size=26, halign="left",
+                        valign="middle", size_hint_y=None, height=84)
+            lab.bind(size=lambda w, v: setattr(w, "text_size", (w.width - 24, None)))
+            lst.add_widget(lab)
 
     # -- §2 Scan & Select ---------------------------------------------------
     def refresh_scents(self):
@@ -196,19 +174,36 @@ class MainApp(MDApp):
 
     def _refresh_scents_worker(self):
         try:
-            scents = self.ctl.scents()
+            groups = self.ctl.scent_groups()
             selected = {s["mac"] for s in self.ctl.selected()}
         except Exception as exc:  # noqa: BLE001
             Logger.error(f"{DEADNET_PREF}: scent read {exc}")
             return
-        Clock.schedule_once(lambda dt: self._render_scents(scents, selected))
+        Clock.schedule_once(lambda dt: self._render_scents(groups, selected))
 
-    def _render_scents(self, scents, selected):
+    def _render_scents(self, groups, selected):
+        """Render the smelled electronics fuzzy-grouped by like-kind (vendor),
+        each family under a header — 'all the Apple phones lined up neatly'."""
         lst = self.root.ids.scent_list
         lst.clear_widgets()
-        for s in scents[:200]:
-            lst.add_widget(self._scent_row(s, s["mac"] in selected))
+        shown = 0
+        for vendor, members in groups:
+            if shown >= 200:
+                break
+            lst.add_widget(self._group_header(vendor, len(members)))
+            for s in members:
+                if shown >= 200:
+                    break
+                lst.add_widget(self._scent_row(s, s["mac"] in selected))
+                shown += 1
         self._refresh_sel_count()
+
+    def _group_header(self, vendor, count):
+        lab = Label(text=f"[b]{vendor}[/b]  [size=16]({count})[/size]", markup=True,
+                    font_size=22, halign="left", valign="middle",
+                    size_hint_y=None, height=40, color=(0.55, 0.7, 1.0, 1))
+        lab.bind(size=lambda w, v: setattr(w, "text_size", (w.width, None)))
+        return lab
 
     def _scent_row(self, s, is_sel):
         row = BoxLayout(size_hint_y=None, height=58, spacing=6)
@@ -249,13 +244,22 @@ class MainApp(MDApp):
         self.root.ids.sel_count.text = f"selected: {n}"
 
     # -- §3 Configure & Trigger ---------------------------------------------
+    def on_focus_mode(self, focused: bool):
+        """Fork toggle: down = FOCUSED (picked electronics only), up = UNFOCUSED
+        (whole airspace). Bird hones leakers either way."""
+        if self.ctl is not None:
+            self.ctl.set_focused(bool(focused))
+        tgl = self.root.ids.tgl_focus
+        tgl.text = ("[b]FOCUSED (picked only)[/b]" if focused
+                    else "[b]UNFOCUSED (whole airspace)[/b]")
+
     def on_fire(self):
         if self.ctl is None:
             return
         if self.ctl.mode != Mode.LOCKED:
-            self._toast("FIRE needs Lock & Level first")
+            self._toast("FIRE needs an associated, smelling link (Smell first)")
             return
-        self._run(lambda: self.ctl.fire(), "firing…")
+        self._run(lambda: self.ctl.fire(focused=self.ctl.focused), "firing…")
 
     def on_cease(self):
         self._run(lambda: self.ctl.cease(), "ceasing…")
@@ -307,9 +311,9 @@ class MainApp(MDApp):
             return
         if self.ctl.mode == Mode.FIRING:
             self._update_gauges(self.ctl.state_metrics())
-        # stream smelled routers into the Detect list while discovering
-        if self.ctl.mode == Mode.RECON and self.root.ids.sm.current == "detect":
-            self._refresh_routers()
+        # stream newly-smelled electronics into the Smell list while sweeping
+        if self.ctl.mode == Mode.LOCKED and self.root.ids.sm.current == "scan":
+            self.refresh_scents()
 
     def _update_gauges(self, m):
         tx = self.root.ids.cell_tx

@@ -61,24 +61,6 @@
             size: self.size
             radius: [24]
 
-# ---- selectable router row (Detect & Select) --------------------------------
-<RouterRow@ToggleButton>:
-    bssid: ''
-    markup: True
-    font_size: 26
-    halign: 'left'
-    valign: 'middle'
-    text_size: self.width - 24, None
-    padding: [12, 8]
-    background_color: [0, 0, 0, 0]
-    canvas.before:
-        Color:
-            rgba: [0.10, 0.42, 0.14, 1] if self.state == 'down' else [0.14, 0.14, 0.17, 1]
-        RoundedRectangle:
-            pos: self.pos
-            size: self.size
-            radius: [12]
-
 <NavButton@Button>:
     markup: True
     font_size: 30
@@ -105,7 +87,7 @@ BoxLayout:
         id: sm
         size_hint_y: 1
 
-        # ---------------------------------------- §1 Detect & Select
+        # ---------------------------------------- §1 Detect (associated airspaces)
         Screen:
             name: 'detect'
             BoxLayout:
@@ -113,7 +95,7 @@ BoxLayout:
                 padding: 24
                 spacing: 12
                 Label:
-                    text: '[b]DETECT & SELECT[/b]'
+                    text: '[b]DETECT[/b]'
                     markup: True
                     font_size: 40
                     size_hint_y: None
@@ -127,24 +109,27 @@ BoxLayout:
                     height: 49
                 PresetButton:
                     id: btn_detect
-                    text: '[b]DETECT & SELECT[/b]'
+                    text: '[b]DETECT AIRSPACES[/b]'
                     accent: [0.30, 0.31, 1.0, 1]
                     font_size: 38
                     size_hint_y: None
                     height: 118
                     on_press: app.on_detect()
                 Label:
-                    id: router_hint
-                    text: 'smelling routers… pick 1–2'
+                    id: detect_hint
+                    text: 'Join the Wi-Fi you own in Android settings — that is your scope.'
                     markup: True
-                    font_size: 24
+                    font_size: 22
                     color: 0.7, 0.7, 0.7, 1
+                    halign: 'center'
+                    valign: 'middle'
+                    text_size: self.width, None
                     size_hint_y: None
-                    height: 34
+                    height: 60
                 ScrollView:
                     size_hint_y: 1
                     GridLayout:
-                        id: router_list
+                        id: airspace_list
                         cols: 1
                         size_hint_y: None
                         height: self.minimum_height
@@ -168,9 +153,9 @@ BoxLayout:
                         color: 0.7, 0.85, 0.7, 1
                 PresetButton:
                     id: btn_connect
-                    text: '[b]CONNECT & SMELL[/b]'
+                    text: '[b]SMELL THIS AIRSPACE[/b]'
                     accent: [0.07, 0.55, 0.14, 1]
-                    font_size: 38
+                    font_size: 36
                     size_hint_y: None
                     height: 118
                     on_press: app.on_connect()
@@ -243,6 +228,24 @@ BoxLayout:
                     font_size: 38
                     size_hint_y: None
                     height: 54
+                BoxLayout:
+                    size_hint_y: None
+                    height: 72
+                    spacing: 12
+                    ToggleButton:
+                        id: tgl_focus
+                        text: '[b]UNFOCUSED (whole airspace)[/b]'
+                        markup: True
+                        font_size: 24
+                        on_state: app.on_focus_mode(self.state == 'down')
+                    Label:
+                        id: fork_hint
+                        text: 'bird hones leakers'
+                        markup: True
+                        font_size: 20
+                        color: 0.7, 0.7, 0.7, 1
+                        size_hint_x: None
+                        width: 230
                 BoxLayout:
                     id: gauge_panel
                     orientation: 'horizontal'

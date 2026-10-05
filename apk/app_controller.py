@@ -1,19 +1,37 @@
 """
-AppController — the brain behind the 2-preset single-radio UI. Bridges the Kivy
-screens to the engine layer (arbiter / radio / finders / emission / birdobserver)
-and enforces the single-radio lifecycle so the two presets can never fight over
-the one RF chain.
+AppController — the brain behind the associate-first DeadNet redesign. Bridges the
+Kivy screens to the engine layer (arbiter / radio / finders / emission /
+birdobserver).
 
-Two presets (owner-confirmed, single internal radio on phy0):
-  * RECON & RECORD  -> radio in MONITOR (via RadioController), FinderAir sniffs
-    802.11 off mon0 into known_scents while it channel-hops. Passive discovery.
-  * LOCK & LEVEL    -> radio handed back to Android + associated (MANAGED), a wired
-    Finder smells the subnet into known_scents; owner selects targets; FIRE launches
-    the native emitter (focused ARP/RA poison) with the BirdObserver airborne and the
-    100 ms rehydrator feeding the survival gauges.
+New operating model (owner-revised: "there's nothing to monitor when you're not
+focusing", so the monitor-mode router-discovery phase is GONE):
 
-Release-back to Android is guaranteed by RadioController (atexit + signals); this
-controller additionally tears everything down on `shutdown()`.
+  DETECT   -> enumerate the Wi-Fi airspace(s) the phone is ALREADY associated to
+              (wlan0, and wlan1 if the framework raised a 2nd STA). No radio seize,
+              no monitor. Selection is IMPLICIT: whatever the owner joined in
+              Android settings *is* the scope. You can only smell air you hold a
+              key to — that is the safety model.
+
+  SMELL    -> stay associated; a wired Finder sweeps the associated subnet(s) into
+              known_scents (append-only master store), fuzzy-grouped by
+              like-electronics (vendor/OUI). This is the full-space smell, scoped to
+              the airspace(s) of interest.
+
+  FIRE     -> one of two forks, both with the BirdObserver airborne:
+                * UNFOCUSED : attention spread evenly across every electronic smelled
+                              on the airspace. If one keeps mailing envelopes despite
+                              the owner's transmissions, the bird hones attention onto
+                              that non-compliant electronic.
+                * FOCUSED   : identical, but the scope is limited up front to the
+                              electronics the owner picked.
+              Internally the native emitter always runs per-host (EmitMode.FOCUSED)
+              so the bird can hone in BOTH forks; the fork only decides which hosts
+              seed the attention set.
+
+Release-back / "leave it how it was found": begin_smell() snapshots the clean Wi-Fi
+baseline before touching any OEM knob; release() restores it. Because we never seize
+the radio into monitor, release does NOT toggle Wi-Fi off/on (that would drop adb),
+it only restores the dual-STA / multi-internet knobs to how they were found.
 
 Headless-safe: the Kivy Logger import is guarded and every device call is funnelled
 through the engine modules, so this file imports and its state machine self-tests
@@ -23,7 +41,7 @@ from __future__ import annotations
 
 import enum
 import threading
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 try:
     from kivy.logger import Logger
@@ -48,14 +66,12 @@ DEADNET_PREF = "DeadNet"
 
 class Preset(enum.Enum):
     NONE = "none"
-    RECON = "recon"          # Recon & Record
-    LOCK = "lock"            # Lock & Level
+    LOCK = "lock"            # associated + smelling (ready to fire)
 
 
 class Mode(enum.Enum):
     IDLE = "idle"            # radio with Android, nothing running
-    RECON = "recon"          # monitor + FinderAir
-    LOCKED = "locked"        # managed + wired Finder, ready to fire
+    LOCKED = "locked"        # associated + wired Finder smelling, ready to fire
     FIRING = "firing"        # emitter airborne
 
 
@@ -71,18 +87,17 @@ class AppController:
         self.mode = Mode.IDLE
         self.net: Optional[NetInfo] = None
 
-        # Detect→Select→Connect flow state: routers the owner picked (max 2)
-        # from the monitor smell, and the dual-STA ("ADHD") request flag.
-        self.target_aps: List[str] = []     # selected AP BSSIDs
-        self.adhd: bool = False             # True => request a 2nd STA link
-        self.links: dict = {}               # post-connect link summary
+        # Detect/Smell flow state.
+        self.airspaces_list: List[dict] = []   # associated airspaces last enumerated
+        self.adhd: bool = False                # True => request a 2nd STA ("double guns")
+        self.focused: bool = False             # FIRE fork: True=picked-only, False=whole
+        self.links: dict = {}                  # post-associate link summary
 
         self.arbiter = RowReaderArbiter(appdir)
         self.radio = RadioController(managed_iface)
         self.toolbroker = ToolBroker(appdir)
 
         # lazily-built engine services (device-touching)
-        self._finder_air = None
         self._finder = None
         self._netfetcher = None
         self._emission = None
@@ -100,7 +115,7 @@ class AppController:
         except Exception as exc:  # noqa: BLE001
             Logger.error(f"{DEADNET_PREF}: on_event({kind}) raised {exc}")
 
-    # -- capability snapshot (for §1 Detect & Connect) ----------------------
+    # -- capability snapshot (for the Detect screen) ------------------------
     def capabilities(self) -> dict:
         caps = self.toolbroker.capabilities()
         return {
@@ -111,83 +126,54 @@ class AppController:
         }
 
     # =======================================================================
-    # DETECT & SELECT  (phase 1: seize radio -> monitor -> smell ROUTERS)
+    # DETECT  (enumerate the airspaces we are ALREADY associated to — no seize)
     # =======================================================================
-    def detect_and_select(self, hop_both_bands: bool = True) -> bool:
-        """Owner hits 'Detect & Select': take the radio into monitor and
-        channel-hop across 2.4+5 GHz so FinderAir smells every ROUTER in the
-        air. Routers are offered via routers(); the owner picks 1-2 before any
-        focused electronic-smelling happens (that waits for connect())."""
-        chans = [1, 6, 11] + ([36, 40, 44, 149, 157] if hop_both_bands else [])
-        ok = self.start_recon(channel=chans[0], hop=False)
-        if not ok:
-            return False
-        # wide hop so we see routers on both bands, not just the social 2.4 set
-        self.radio.start_hopping(
-            channels=chans,
-            dwell_s=max(0.15, self.knobs.finder_air_hop_dwell_ms / 1000.0))
-        self.emit("detecting")
+    def detect(self) -> bool:
+        """Owner hits 'Detect': read which Wi-Fi airspace(s) the phone is joined
+        to right now. No radio seize, no monitor — selection is implicit in what
+        the owner associated with in Android settings."""
+        self.airspaces_list = self.airspaces()
+        self.emit("detected", airspaces=self.airspaces_list)
         return True
 
-    def routers(self) -> List[dict]:
-        """APs smelled during Detect & Select (is_station=0, named SSID),
-        strongest signal first — the selectable target list."""
-        aps = [s for s in self.scents()
-               if not s.get("is_station") and (s.get("ssid") or "").strip()]
-        aps.sort(key=lambda s: (s.get("signal_dbm") or -999), reverse=True)
-        return aps
-
-    def select_ap(self, bssid: str) -> bool:
-        """Pick a router as an attack target. Capped at 2 (double-guns/ADHD)."""
-        bssid = (bssid or "").lower()
-        if bssid in self.target_aps:
-            return True
-        if len(self.target_aps) >= 2:
-            self.emit("error", msg="at most 2 networks (double-guns / ADHD)")
-            return False
-        self.target_aps.append(bssid)
-        self.emit("ap_selected", bssid=bssid, count=len(self.target_aps))
-        return True
-
-    def deselect_ap(self, bssid: str) -> None:
-        bssid = (bssid or "").lower()
-        if bssid in self.target_aps:
-            self.target_aps.remove(bssid)
-            self.emit("ap_selected", bssid=bssid, count=len(self.target_aps))
-
-    def clear_aps(self) -> None:
-        self.target_aps = []
-        self.emit("ap_selected", bssid="", count=0)
-
-    def selected_routers(self) -> List[dict]:
-        """Full scent rows for the currently-picked target BSSIDs."""
-        by_bssid = {s.get("mac"): s for s in self.routers()}
-        return [by_bssid[b] for b in self.target_aps if b in by_bssid]
+    def airspaces(self) -> List[dict]:
+        """The airspace(s) we are associated to: wlan0 always, wlan1 if the OEM
+        dual-STA raised a 2nd link. Each is {iface, ssid, bssid}."""
+        out: List[dict] = []
+        ssid = self.radio.current_ssid()
+        bssid = self.radio.is_associated() or ""
+        if ssid or bssid:
+            out.append({"iface": self.managed_iface, "ssid": ssid, "bssid": bssid})
+        sec = self.radio.secondary_iface()
+        if sec:
+            out.append({"iface": sec, "ssid": "",
+                        "bssid": (self.radio.link_bssid(sec) or "")})
+        return out
 
     # =======================================================================
-    # CONNECT  (phase 2: release monitor -> associate -> focused smelling)
+    # SMELL  (associate-ensure -> wired subnet sweep scoped to the airspace)
     # =======================================================================
-    def connect(self, adhd: Optional[bool] = None) -> bool:
-        """Transition Detect->Attack. Releases the monitor, hands wlan0 back so
-        it re-associates to the network the owner joined in Android, scopes the
-        focused electronic-smelling to that subnet, and (if ADHD / 2 targets and
-        allowed) requests a 2nd STA. Empirical constraint: a monitor cannot run
-        beside the associated link, so smelling here is subnet/ARP-based, phased
-        after association — never a parallel monitor vif."""
+    def begin_smell(self, adhd: Optional[bool] = None) -> bool:
+        """Begin smelling the associated airspace. We stay associated (no monitor):
+        snapshot the clean baseline, best-effort permit a 2nd STA if ADHD, confirm
+        the managed link, discover the subnet, and start the wired Finder sweeping
+        it into known_scents. Empirically a monitor cannot run beside the associated
+        link, so smelling is subnet/ARP-based on the live association."""
         with self._lock:
             self.adhd = self.adhd if adhd is None else bool(adhd)
-            # tear down the discovery monitor first (mon+managed can't coexist)
-            if self.mode == Mode.RECON:
-                self._stop_recon()
-            # best-effort: permit the 2nd STA before association if ADHD wanted
-            want_second = self.adhd and len(self.target_aps) >= 2
+            want_second = self.adhd
+            # snapshot "how it was found" before we touch any OEM knob
+            try:
+                self.radio.capture_baseline()
+            except Exception:  # noqa: BLE001
+                pass
             if want_second:
                 try:
                     self.radio.set_dual_sta(True)
                 except Exception:  # noqa: BLE001
                     pass
             if not self.radio.ensure_managed():
-                self.emit("error", msg="radio did not associate")
+                self.emit("error", msg="not associated — join a Wi-Fi you own first")
                 return False
             from engine.iface import discover_iface_net
             try:
@@ -199,10 +185,14 @@ class AppController:
             self.links = self._link_summary(want_second)
             self.preset = Preset.LOCK
             self.mode = Mode.LOCKED
-            self.emit("connected", links=self.links, net=self._net_summary())
+            self.emit("smelling", links=self.links, net=self._net_summary())
             self.emit("mode", mode=self.mode.value, preset=self.preset.value,
                       net=self._net_summary())
             return True
+
+    # back-compat alias (older callers / tests)
+    def connect(self, adhd: Optional[bool] = None) -> bool:
+        return self.begin_smell(adhd=adhd)
 
     def _link_summary(self, wanted_second: bool) -> dict:
         """Describe the associated link(s) and which mode we actually got."""
@@ -210,7 +200,7 @@ class AppController:
         bssid = self.radio.is_associated() or ""
         second = self.radio.secondary_iface()
         if second is not None:
-            mode = "adhd" if wanted_second else "double_guns"
+            mode = "double_guns" if wanted_second else "two_links"
         else:
             mode = "single"
         return {
@@ -219,64 +209,6 @@ class AppController:
             "mode": mode,
             "wanted_second": wanted_second,
         }
-
-    # =======================================================================
-    # PRESET: RECON & RECORD  (monitor discovery)
-    # =======================================================================
-    def start_recon(self, channel: int = 6, hop: bool = True) -> bool:
-        with self._lock:
-            if self.mode == Mode.FIRING:
-                self.cease()
-            if self.mode == Mode.LOCKED:
-                self._stop_wired_finder()
-            if not self.radio.start_recon(channel):
-                self.emit("error", msg="could not seize radio into monitor")
-                return False
-            if hop:
-                dwell = max(0.05, self.knobs.finder_air_hop_dwell_ms / 1000.0)
-                self.radio.start_hopping(dwell_s=dwell)
-            # FinderAir sniffs mon0 into known_scents
-            from engine.finder_air import FinderAir
-            self._finder_air = FinderAir(
-                self.arbiter, self.radio.mon_iface, net_id="air",
-                on_scent=lambda rec: self.emit("scent", mac=rec.mac))
-            self._finder_air.start()
-            self.preset = Preset.RECON
-            self.mode = Mode.RECON
-            self.emit("mode", mode=self.mode.value, preset=self.preset.value)
-            return True
-
-    def _stop_recon(self) -> None:
-        if self._finder_air is not None:
-            try:
-                self._finder_air.stop()
-            except Exception:  # noqa: BLE001
-                pass
-            self._finder_air = None
-        self.radio.stop_hopping()
-
-    # =======================================================================
-    # PRESET: LOCK & LEVEL  (associate + wired discovery + fire)
-    # =======================================================================
-    def start_lock_level(self) -> bool:
-        with self._lock:
-            if self.mode == Mode.RECON:
-                self._stop_recon()
-            if not self.radio.ensure_managed():
-                self.emit("error", msg="radio did not associate")
-                return False
-            from engine.iface import discover_iface_net
-            try:
-                self.net = discover_iface_net(self.managed_iface)
-            except Exception as exc:  # noqa: BLE001
-                self.emit("error", msg=f"net discovery failed: {exc}")
-                return False
-            self._start_wired_finder()
-            self.preset = Preset.LOCK
-            self.mode = Mode.LOCKED
-            self.emit("mode", mode=self.mode.value, preset=self.preset.value,
-                      net=self._net_summary())
-            return True
 
     def _start_wired_finder(self) -> None:
         from engine.finder import Finder, NetFetcher
@@ -312,7 +244,7 @@ class AppController:
         self._finder = None
 
     # =======================================================================
-    # SCAN & SELECT  (station selection section)
+    # SMELL VIEW  (known_scents, fuzzy-grouped by like-electronics)
     # =======================================================================
     def scents(self) -> List[dict]:
         rows = self.arbiter.read(
@@ -323,13 +255,24 @@ class AppController:
                 "signal_dbm", "is_station", "net_id", "last_seen_ms")
         return [dict(zip(cols, r)) for r in rows]
 
+    def scent_groups(self) -> List[Tuple[str, List[dict]]]:
+        """Fuzzy associator: the smelled electronics lined up by like-kind — all
+        the Apple phones in one row, etc. Groups by OUI vendor (blank => 'unknown'),
+        biggest family first. Append-only master store: nothing is pruned, only
+        regrouped, so a device keeps its place across re-smells."""
+        groups: dict = {}
+        for s in self.scents():
+            key = (s.get("vendor") or "").strip() or "unknown"
+            groups.setdefault(key, []).append(s)
+        return sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0].lower()))
+
     def selected(self) -> List[dict]:
         rows = self.arbiter.read(
             DB_ATTENTION, "SELECT mac, ip, net_id, weight, pinned FROM attention")
         return [dict(zip(("mac", "ip", "net_id", "weight", "pinned"), r)) for r in rows]
 
     def select(self, mac: str, weight: float = 1.0, pinned: bool = True) -> None:
-        """'Select +' — pin a scent into the attention list for focused fire."""
+        """'Select +' — pin a scent into the attention list for a FOCUSED fire."""
         row = self.arbiter.read(
             DB_KNOWN_SCENTS, "SELECT ip, net_id FROM scents WHERE mac=?", (mac,))
         ip, net_id = (row[0] if row else ("", ""))
@@ -348,26 +291,41 @@ class AppController:
         self.emit("selection_cleared")
 
     # =======================================================================
-    # CONFIGURE & TRIGGER  (fire the focused emitter)
+    # CONFIGURE & TRIGGER  (fire the emitter; focused or unfocused fork)
     # =======================================================================
-    def fire(self, on_stats=None) -> bool:
-        """Launch the native emitter on the associated link, airborne BirdObserver
-        + 100 ms rehydrator. Requires LOCK & LEVEL (an associated managed link)."""
+    def set_focused(self, focused: bool) -> None:
+        self.focused = bool(focused)
+        self.emit("fork", focused=self.focused)
+
+    def fire(self, focused: Optional[bool] = None, on_stats=None) -> bool:
+        """Launch the native emitter on the associated link with the BirdObserver
+        airborne + the 100 ms rehydrator + the live-gauge SurvivalMonitor. Requires
+        an associated, smelling link (Mode.LOCKED).
+
+        focused=True  -> aim only at the electronics the owner picked.
+        focused=False -> aim at every electronic smelled on the airspace (baseline),
+                         letting the bird hone onto any that keep leaking.
+        """
         with self._lock:
             if self.mode != Mode.LOCKED:
-                self.emit("error", msg="FIRE requires Lock & Level (associate first)")
+                self.emit("error", msg="FIRE needs an associated, smelling link")
                 return False
+            focused = self.focused if focused is None else bool(focused)
+            self.focused = focused
             from engine.emission import EmissionController
             from engine.birdobserver import BirdObserver
 
-            # emit.cpp only transmits at focus entries, so give it targets:
-            # the smelled hosts on the connected subnet (+ the gateway). Manual
-            # station picks, if any, are kept. Without this FIRE sends nothing.
-            n_targets = self._seed_targets()
-            focused = n_targets > 0
-            self.knobs.emit_mode = EmitMode.FOCUSED if focused else EmitMode.UNFOCUSED
+            # Seed the attention/focus set. emit.cpp only transmits at focus
+            # entries, so an empty set would send nothing. The bird hones in BOTH
+            # forks, so the emitter always runs per-host (EmitMode.FOCUSED); the
+            # fork only decides WHICH hosts seed the set.
+            n_targets = self._seed_targets(focused)
+            self.knobs.emit_mode = EmitMode.FOCUSED
             if n_targets == 0:
-                self.emit("error", msg="no targets smelled yet — scan the subnet first")
+                self.emit("error", msg=(
+                    "nothing to aim at — pick electronics (focused) or let the "
+                    "smell finish (unfocused)"))
+                return False
             our_mac = self._iface_mac(self.managed_iface)
             self._emission = EmissionController(self.arbiter, self.appdir, self.knobs)
             self._emission.add_transmitter(self.managed_iface, self.net, our_mac=our_mac)
@@ -393,14 +351,13 @@ class AppController:
             return True
 
     def state_metrics(self) -> dict:
-        """Metrics for the §3 gauges (polled on a Clock tick). Preferred source
-        is the live SurvivalMonitor sample (our ARP TX / surviving-leaks /
-        evidence off the associated link); falls back to the DB_STATE rollup
-        (emit.cpp native per-target stats) when no survival sample is in yet."""
+        """Metrics for the gauges (polled on a Clock tick). Preferred source is the
+        live SurvivalMonitor sample (our ARP TX / surviving-leaks / evidence off the
+        associated link); falls back to the DB_STATE rollup (emit.cpp native
+        per-target stats) when no survival sample is in yet."""
         s = self._survival_sample
         if s is not None:
-            leaking = s.surv_ps
-            return {"tx_ps": s.arp_tx_ps, "leaking": leaking,
+            return {"tx_ps": s.arp_tx_ps, "leaking": s.surv_ps,
                     "evidence": s.evidence_ps,
                     "confirmed": bool(s.confirmed) and self.mode == Mode.FIRING,
                     "targets": len(self.selected())}
@@ -413,32 +370,42 @@ class AppController:
         return {"tx_ps": tx, "leaking": leaking, "evidence": evidence,
                 "confirmed": confirmed, "targets": len(rows)}
 
-    def _seed_targets(self) -> int:
-        """Fill the attention/focus set from the hosts smelled on the connected
-        subnet (ARP sweep => each has a real MAC) plus the gateway, so emit.cpp
-        has something to aim at. Skips our own device. Keeps any manual picks.
-        Returns the number of victim targets (excludes the gateway)."""
+    def _seed_targets(self, focused: bool) -> int:
+        """Fill the attention/focus set so emit.cpp has something to aim at, and
+        return the number of victim targets (excludes the gateway).
+
+          * focused   : keep only the owner's picks (already pinned in attention via
+                        select()); just make sure the gateway is present.
+          * unfocused : add every smelled host on the connected subnet, evenly.
+        The gateway is pinned + marked so emit can recover its IPv4 for the
+        victim-side poison; emit never victimizes it. Our own device is skipped."""
         if self.net is None:
             return 0
         net_id = self.net.subnet_cidr or self.net.iface
         our_ip = self.net.device_ip or ""
         gw_ip = self.net.gateway_ipv4 or ""
         gw_mac = self.net.gateway_mac or ""
-        # gateway: present so emit can recover gw IPv4 (victim-side poison);
-        # pinned + marked so we can tell it apart — emit never victimizes it.
         if gw_mac and gw_ip:
             self.arbiter.write(
                 DB_ATTENTION,
                 "INSERT OR REPLACE INTO attention(mac, ip, net_id, weight, pinned) "
                 "VALUES(?,?,?,?,1)", (gw_mac, gw_ip, net_id, 1.0))
-        victims = 0
+        if focused:
+            # picks are already pinned in attention (sync, via select()); count them
+            rows = self.arbiter.read(
+                DB_ATTENTION, "SELECT mac FROM attention WHERE mac != ?", (gw_mac,))
+            return len(rows)
+        # unfocused: seed every smelled host. This is a one-shot at FIRE (not a hot
+        # path), so use a synchronous write — the attention set is then immediately
+        # correct for the emitter, the count display and the selected() readback.
         rows = self.arbiter.read(
             DB_KNOWN_SCENTS,
             "SELECT mac, ip FROM scents WHERE mac != '' AND ip != ''")
+        victims = 0
         for mac, ip in rows:
             if ip in (our_ip, gw_ip) or mac == gw_mac:
                 continue
-            self.arbiter.write_async(
+            self.arbiter.write(
                 DB_ATTENTION,
                 "INSERT OR IGNORE INTO attention(mac, ip, net_id, weight, pinned) "
                 "VALUES(?,?,?,1.0,0)", (mac, ip, net_id))
@@ -512,16 +479,18 @@ class AppController:
     # RELEASE / SHUTDOWN
     # =======================================================================
     def release(self) -> None:
-        """Give the radio back to Android and stop every service. Safe to re-call."""
+        """Give the radio back to Android and stop every service. Safe to re-call.
+        Because we never seized monitor, this only restores the OEM dual-STA /
+        multi-internet knobs to how they were found (no disruptive Wi-Fi toggle,
+        so adb/tailscale on wlan0 survive)."""
         with self._lock:
             self.cease()
-            self._stop_recon()
             self._stop_wired_finder()
             try:
                 self.radio.release_to_android(wait_reconnect=False)
             except Exception:  # noqa: BLE001
                 pass
-            self.target_aps = []
+            self.airspaces_list = []
             self.links = {}
             self.preset = Preset.NONE
             self.mode = Mode.IDLE
@@ -546,7 +515,7 @@ class AppController:
 
 if __name__ == "__main__":
     # Off-device state-machine self-test: the device-touching engine services are
-    # stubbed; we verify the single-radio lifecycle transitions + select/fire gating.
+    # stubbed; we verify the associate-first lifecycle + focused/unfocused fire gating.
     import tempfile
 
     events: List[tuple] = []
@@ -555,24 +524,17 @@ if __name__ == "__main__":
 
     # stub the radio + engine services so nothing touches a device
     class _FakeRadio:
-        def __init__(self): self.state = CardState.ANDROID; self.mon_iface = "mon0"
-        def start_recon(self, channel=6): self.state = CardState.MONITOR; return True
-        def start_hopping(self, **k): pass
-        def stop_hopping(self): pass
+        def __init__(self): self.state = CardState.ANDROID
         def ensure_managed(self, **k): self.state = CardState.MANAGED; return True
         def is_associated(self): return "aa:bb:cc:dd:ee:ff"
         def release_to_android(self, **k): self.state = CardState.ANDROID; return True
         def current_ssid(self): return "HomeNet"
         def secondary_iface(self): return None
+        def link_bssid(self, iface): return None
+        def capture_baseline(self): return {}
+        def restore_baseline(self): pass
         def set_dual_sta(self, on): pass
     ctl.radio = _FakeRadio()
-
-    class _FakeFinderAir:
-        def __init__(self, *a, **k): pass
-        def start(self): pass
-        def stop(self): pass
-    import engine.finder_air as _fa
-    _fa.FinderAir = _FakeFinderAir
 
     _NET = NetInfo(iface="wlan0", device_ip="192.168.1.50", cidr=24,
                    subnet_cidr="192.168.1.0/24", gateway_ipv4="192.168.1.1",
@@ -593,16 +555,9 @@ if __name__ == "__main__":
     _f.Finder = _FakeFinder
     _f.NetFetcher = _FakeNetFetcher
 
-    class _FakeTx(list):
-        pass
     class _FakeEmission:
-        def __init__(self, *a, **k): self.transmitters = lambda: ["wlan0"]
+        def __init__(self, *a, **k): self._rehydrator = None
         def add_transmitter(self, *a, **k): pass
-        def start(self): pass
-        def stop(self): pass
-    class _FakeRSM:
-        def __init__(self, *a, **k): pass
-        def set_escaped_source(self, fn): pass
         def start(self): pass
         def stop(self): pass
     class _FakeBird:
@@ -612,64 +567,76 @@ if __name__ == "__main__":
     import engine.emission as _em
     import engine.birdobserver as _bo
     _em.EmissionController = _FakeEmission
-    _em.RehydrationStateMaintainer = _FakeRSM
     _bo.BirdObserver = _FakeBird
+    # survival monitor is imported lazily inside _start_survival; stub the module
+    import sys as _sys
+    import types as _types
+    _sm = _types.ModuleType("survival_monitor")
+    class _FakeSurv:
+        def __init__(self, *a, **k): pass
+        def start(self): pass
+        def stop(self): pass
+    _sm.SurvivalMonitor = _FakeSurv
+    _sys.modules["survival_monitor"] = _sm
+    ctl._copy_sniff = lambda: "/tmp/sniff"   # pretend the binary is staged
 
-    # 1) Recon preset
-    assert ctl.start_recon(channel=6) is True
-    assert ctl.mode == Mode.RECON and ctl.preset == Preset.RECON
-
-    # 2) FIRE must be refused while not locked
+    # 1) FIRE must be refused while not locked
     assert ctl.fire() is False
 
-    # 3) switch to Lock & Level (recon torn down, radio associated, net discovered)
-    assert ctl.start_lock_level() is True
+    # 2) DETECT: enumerate the associated airspace (no seize)
+    assert ctl.detect() is True
+    assert ctl.airspaces_list == [{"iface": "wlan0", "ssid": "HomeNet",
+                                   "bssid": "aa:bb:cc:dd:ee:ff"}], ctl.airspaces_list
+    assert ctl.mode == Mode.IDLE, "detect must not change radio mode"
+
+    # 3) SMELL: associate-ensure + discover + wired finder
+    assert ctl.begin_smell(adhd=True) is True
     assert ctl.mode == Mode.LOCKED and ctl.net.subnet_cidr == "192.168.1.0/24"
+    assert ctl.links["mode"] == "single"  # fake has no wlan1
+    assert ctl.links["wlan0"]["ssid"] == "HomeNet"
 
-    # 4) seed a scent + select it -> focused fire
+    # 4) seed a couple of scents
     ctl.arbiter.write(DB_KNOWN_SCENTS,
-                      "INSERT OR REPLACE INTO scents(mac, ip, net_id, last_seen_ms) "
-                      "VALUES(?,?,?,?)", ("de:ad:00:00:00:01", "192.168.1.77", "lan", now_ms()))
-    assert len(ctl.scents()) == 1
-    ctl.select("de:ad:00:00:00:01")
-    assert len(ctl.selected()) == 1
+                      "INSERT OR REPLACE INTO scents(mac, ip, vendor, net_id, last_seen_ms) "
+                      "VALUES(?,?,?,?,?)", ("de:ad:00:00:00:01", "192.168.1.77", "Apple", "lan", now_ms()))
+    ctl.arbiter.write(DB_KNOWN_SCENTS,
+                      "INSERT OR REPLACE INTO scents(mac, ip, vendor, net_id, last_seen_ms) "
+                      "VALUES(?,?,?,?,?)", ("de:ad:00:00:00:02", "192.168.1.78", "Apple", "lan", now_ms()))
+    ctl.arbiter.write(DB_KNOWN_SCENTS,
+                      "INSERT OR REPLACE INTO scents(mac, ip, vendor, net_id, last_seen_ms) "
+                      "VALUES(?,?,?,?,?)", ("de:ad:00:00:00:03", "192.168.1.79", "", "lan", now_ms()))
+    assert len(ctl.scents()) == 3
+    groups = dict(ctl.scent_groups())
+    assert len(groups["Apple"]) == 2 and len(groups["unknown"]) == 1, ctl.scent_groups()
 
-    assert ctl.fire() is True
+    # 5) UNFOCUSED fire: every smelled host seeds the set (3 victims), bird airborne
+    assert ctl.fire(focused=False) is True
     assert ctl.mode == Mode.FIRING
-    assert ctl.knobs.emit_mode == EmitMode.FOCUSED, "selected target -> focused mode"
-
-    # 5) cease -> back to LOCKED; release -> IDLE + radio handed back
+    assert ctl.knobs.emit_mode == EmitMode.FOCUSED, "emit always per-host so bird hones"
+    victims = [r["mac"] for r in ctl.selected() if r["mac"] != "aa:bb:cc:00:00:01"]
+    assert len(victims) == 3, victims
     ctl.cease()
     assert ctl.mode == Mode.LOCKED
+
+    # 6) FOCUSED fire: only the owner's picks seed the set
+    ctl.clear_selection()
+    ctl.select("de:ad:00:00:00:01")
+    assert ctl.fire(focused=True) is True
+    victims = [r["mac"] for r in ctl.selected() if r["mac"] != "aa:bb:cc:00:00:01"]
+    assert victims == ["de:ad:00:00:00:01"], victims
+    ctl.cease()
+
+    # 7) FOCUSED with no picks is refused (nothing to aim at)
+    ctl.clear_selection()
+    assert ctl.fire(focused=True) is False
+
+    # 8) release -> IDLE, radio handed back
     ctl.release()
     assert ctl.mode == Mode.IDLE and ctl.radio.state == CardState.ANDROID
-
-    # 6) NEW FLOW: detect & select -> router list -> pick -> connect
-    assert ctl.detect_and_select() is True
-    assert ctl.mode == Mode.RECON
-    ctl.arbiter.write(DB_KNOWN_SCENTS,
-        "INSERT OR REPLACE INTO scents(mac, ssid, is_station, signal_dbm, last_seen_ms) "
-        "VALUES(?,?,?,?,?)", ("7c:db:98:64:54:9a", "MySpectrum-2G", 0, -40, now_ms()))
-    ctl.arbiter.write(DB_KNOWN_SCENTS,
-        "INSERT OR REPLACE INTO scents(mac, ssid, is_station, signal_dbm, last_seen_ms) "
-        "VALUES(?,?,?,?,?)", ("de:ad:be:ef:00:02", "FarAP", 0, -80, now_ms()))
-    ctl.arbiter.write(DB_KNOWN_SCENTS,
-        "INSERT OR REPLACE INTO scents(mac, ssid, is_station, last_seen_ms) "
-        "VALUES(?,?,?,?)", ("00:00:00:00:00:99", "", 1, now_ms()))  # station, no ssid
-    routers = ctl.routers()
-    assert [r["mac"] for r in routers] == ["7c:db:98:64:54:9a", "de:ad:be:ef:00:02"], routers
-    assert ctl.select_ap("7c:db:98:64:54:9a") is True
-    assert ctl.select_ap("de:ad:be:ef:00:02") is True
-    assert ctl.select_ap("aa:aa:aa:aa:aa:aa") is False  # capped at 2
-    assert len(ctl.selected_routers()) == 2
-    assert ctl.connect(adhd=True) is True
-    assert ctl.mode == Mode.LOCKED and ctl.links["mode"] == "single"  # fake has no wlan1
-    assert ctl.links["wlan0"]["ssid"] == "HomeNet"
-    ctl.release()
-    assert ctl.target_aps == [] and ctl.mode == Mode.IDLE
+    assert ctl.airspaces_list == []
 
     kinds = [k for k, _ in events]
-    assert "mode" in kinds and "selected" in kinds
+    assert "detected" in kinds and "smelling" in kinds and "mode" in kinds
     ctl.arbiter.close()
     print("modes seen:", [d.get("mode") for k, d in events if k == "mode"])
-    print("U11/U12(AppController) PASS")
+    print("AppController (associate-first) PASS")
