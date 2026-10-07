@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import ipaddress
 import threading
 import subprocess
 from typing import Callable, Dict, List, Optional
@@ -70,6 +71,8 @@ def _log(msg: str) -> None:
 def parse_tcpdump_arp(
     lines,
     oui_classify: Optional[Callable[[str], str]] = None,
+    ignore_src=None,
+    subnet=None,
 ) -> List[ScentRecord]:
     """Parse `tcpdump -i <iface> -nn -e -l arp` text into deduped station
     ScentRecords (merged by mac). Both ARP request and reply forms are mined:
@@ -77,17 +80,36 @@ def parse_tcpdump_arp(
       * Request "who-has X tell Y"  -> sender Y lives at the frame's source MAC.
       * Reply   "X is-at Z"         -> responder X lives at MAC Z.
 
-    Pure: no subprocess, no Arbiter writes. `oui_classify` defaults to "" so it
-    runs with no device and no oui.csv.
+    CRITICAL FILTER: `ignore_src` is a set of Ethernet-source MACs to drop the
+    WHOLE frame for — we pass our own iface MAC here. emit.cpp sends every poison
+    frame with ether_src = our_mac but a FRESH RANDOM 'dead' MAC in the ARP
+    payload (`is-at`), so without this filter the attack's own packets each look
+    like a new device and balloon known_scents until the app crashes. Dropping by
+    Ethernet source removes 100% of our injected traffic; real victims re-ARP with
+    their own src MAC and survive. `subnet` (an ip_network) additionally bounds
+    recorded IPs to the airspace.
+
+    Pure: no subprocess, no Arbiter writes. `oui_classify` defaults to "".
     """
     if oui_classify is None:
         oui_classify = lambda _mac: ""  # noqa: E731
+    ignore = {m.lower() for m in (ignore_src or ())}
 
     ts = now_ms()
     out: Dict[str, ScentRecord] = {}
 
+    def _in_subnet(ip: str) -> bool:
+        if subnet is None:
+            return True
+        try:
+            return ipaddress.ip_address(ip) in subnet
+        except ValueError:
+            return False
+
     def _add(mac: str, ip: str) -> None:
         if _mac_skip(mac):
+            return
+        if not ip or not _in_subnet(ip):
             return
         mac = mac.lower()
         rec = out.get(mac)
@@ -102,6 +124,8 @@ def parse_tcpdump_arp(
     for line in lines:
         src = _SRC_RE.search(line)
         src_mac = src.group(1) if src else ""
+        if src_mac.lower() in ignore:
+            continue  # our own injected ARP (ether src == our_mac) — never ingest
         m = _TELL_RE.search(line)
         if m:
             # sender IP is the "tell" address; its MAC is the frame source
@@ -120,11 +144,22 @@ class PassiveFinder:
     """Listens to ARP on an associated (managed) iface and upserts every live
     sender/responder into known_scents. No frames are injected — pure listen."""
 
-    def __init__(self, arbiter, iface: str, net_id: str = "", on_scent=None):
+    def __init__(self, arbiter, iface: str, net_id: str = "", on_scent=None,
+                 our_mac: str = "", subnet_cidr: str = "", cap: int = 1024):
         self.arbiter = arbiter
         self.iface = iface
         self.net_id = net_id
         self.on_scent = on_scent
+        # Our own frames (ether src == our_mac) are NEVER ingested — see
+        # parse_tcpdump_arp. Without this the blind-/24 attack's own packets
+        # (random dead MAC per packet) balloon known_scents and crash the app.
+        self._ignore = {our_mac.lower()} if our_mac else set()
+        try:
+            self._subnet = ipaddress.ip_network(subnet_cidr, strict=False) if subnet_cidr else None
+        except ValueError:
+            self._subnet = None
+        self._cap = max(0, int(cap))     # hard ceiling on distinct passive finds
+        self._seen = set()               # macs already upserted this session
 
         self._proc: Optional[subprocess.Popen] = None
         self._thread: Optional[threading.Thread] = None
@@ -191,11 +226,17 @@ class PassiveFinder:
                 if self._stop_evt.is_set():
                     break
                 try:
-                    recs = parse_tcpdump_arp([line], oui_classify=_oui.classify)
+                    recs = parse_tcpdump_arp([line], oui_classify=_oui.classify,
+                                             ignore_src=self._ignore, subnet=self._subnet)
                 except Exception as exc:  # noqa: BLE001
                     _log(f"parse error: {exc}")
                     continue
                 for rec in recs:
+                    if rec.mac in self._seen:
+                        continue
+                    if self._cap and len(self._seen) >= self._cap:
+                        continue  # ceiling hit — stop ingesting (anti-balloon backstop)
+                    self._seen.add(rec.mac)
                     rec.net_id = self.net_id
                     try:
                         upsert_scent(self.arbiter, rec)
@@ -247,6 +288,30 @@ def _self_test() -> None:
     assert "ff:ff:ff:ff:ff:ff" not in by_mac, "broadcast source must be skipped"
     assert len(recs) == 3, recs
     print("  [1] parse_tcpdump_arp: request+reply mined, broadcast skipped  ok")
+
+    # [1b] our own injected poison (ether src == our_mac, fresh random is-at MAC)
+    #      must be dropped by the ether-src filter — this is the balloon fix.
+    OUR = "02:aa:bb:cc:dd:ee"
+    injected = _SAMPLE_ARP + [
+        "21:30:03.0 02:aa:bb:cc:dd:ee > ff:ff:ff:ff:ff:ff, ethertype ARP (0x0806), "
+        "length 42: Reply 192.168.1.1 is-at 02:de:ad:00:00:99, length 28",
+        "21:30:03.1 02:aa:bb:cc:dd:ee > ff:ff:ff:ff:ff:ff, ethertype ARP (0x0806), "
+        "length 42: Reply 192.168.1.1 is-at 02:de:ad:00:00:9a, length 28",
+    ]
+    recs_f = parse_tcpdump_arp(injected, ignore_src={OUR})
+    macs_f = {r.mac for r in recs_f}
+    assert "02:de:ad:00:00:99" not in macs_f and "02:de:ad:00:00:9a" not in macs_f, macs_f
+    assert len(recs_f) == 3, recs_f  # only the 3 real hosts, not our 2 injected
+    print("  [1b] ether-src == our_mac filter drops injected poison  ok")
+
+    # [1c] subnet bound drops off-airspace senders
+    net = ipaddress.ip_network("192.168.1.0/24")
+    offsub = ["21:30:04.0 de:ad:be:ef:00:09 > ff:ff:ff:ff:ff:ff, ethertype ARP "
+              "(0x0806), length 42: Request who-has 10.0.0.1 tell 10.0.0.9, length 28"]
+    recs_s = parse_tcpdump_arp(_SAMPLE_ARP + offsub, subnet=net)
+    assert all(r.mac != "de:ad:be:ef:00:09" for r in recs_s), "off-subnet must drop"
+    assert len(recs_s) == 3, recs_s
+    print("  [1c] subnet bound drops off-airspace senders  ok")
 
     from engine.arbiter import RowReaderArbiter
     tmp = tempfile.mkdtemp(prefix="finderpassive_selftest_")

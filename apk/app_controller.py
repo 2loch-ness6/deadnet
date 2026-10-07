@@ -459,7 +459,7 @@ class AppController:
             # isolation that silently drops active probes), and the poison
             # provokes victims to re-ARP — so the attack itself populates the
             # electronic list with hosts active smell could never knock awake.
-            self._start_passive()
+            self._start_passive(our_mac=our_mac)
 
             if self.knobs.bird_airborne:
                 self._bird = BirdObserver(self.arbiter, self.knobs)
@@ -598,13 +598,18 @@ class AppController:
             Logger.error(f"{DEADNET_PREF}: sniff copy failed {exc}")
             return None
 
-    def _start_passive(self) -> None:
+    def _start_passive(self, our_mac: str = "") -> None:
         """Start the ARP-listen passive finder on the associated link (discovery
-        that works under client isolation). Best-effort: a failure never blocks fire."""
+        that works under client isolation). Best-effort: a failure never blocks fire.
+        our_mac is passed so the finder drops OUR OWN injected poison (ether src ==
+        our_mac) — otherwise the blind-/24 blast's random dead MACs balloon the
+        scent store and crash the app."""
         try:
             from engine.finder_passive import PassiveFinder
             self._passive = PassiveFinder(
-                self.arbiter, self.managed_iface, net_id=self._attention_net_id())
+                self.arbiter, self.managed_iface, net_id=self._attention_net_id(),
+                our_mac=our_mac,
+                subnet_cidr=(self.net.subnet_cidr if self.net else ""))
             self._passive.start()
         except Exception as exc:  # noqa: BLE001
             Logger.error(f"{DEADNET_PREF}: passive finder failed to start {exc}")
