@@ -170,7 +170,10 @@ class Finder:
     writes go through the Arbiter into DB_KNOWN_SCENTS.
     """
 
-    PING_CHUNK = 64            # hosts pinged in parallel per su round-trip
+    # Smaller chunks = more progress ticks so the n/254 counter visibly climbs.
+    # Each chunk is still ONE su round-trip (its hosts ping in parallel), so this
+    # does NOT bring back the per-host su-fork storm — it just reports finer.
+    PING_CHUNK = 16            # hosts pinged in parallel per su round-trip
     PING_CHUNK_TIMEOUT = 8.0   # seconds to let one chunk's pings finish
 
     def __init__(self, arbiter, iface: str, net: NetInfo, on_progress=None):
