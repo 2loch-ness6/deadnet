@@ -445,29 +445,26 @@ class AppController:
 
     # -- live-gauge survival monitor ----------------------------------------
     def _iface_mac(self, iface: str) -> str:
-        try:
-            import subprocess
-            cp = subprocess.run(
-                ["su", "-c", f"cat /sys/class/net/{iface}/address"],
-                capture_output=True, text=True, timeout=5)
-            return (cp.stdout or "").strip()
-        except Exception:  # noqa: BLE001
-            return ""
+        from engine import rootshell
+        return rootshell.su(f"cat /sys/class/net/{iface}/address").strip()
 
     def _copy_sniff(self) -> Optional[str]:
         """Copy sniff.<arch> into appdir (root-owned, +x), mirroring emission's
         binary prep. Returns the on-device path, or None if unavailable."""
         try:
             import os
-            import subprocess
+            from engine import rootshell
             from engine.emission import _arch_suffix
             # assets live beside this file (apk/assets), not under appdir
             here = os.path.dirname(os.path.abspath(__file__))
             src = os.path.join(here, "assets", f"sniff.{_arch_suffix()}")
             dst = os.path.join(self.appdir, f"sniff.{_arch_suffix()}")
-            subprocess.run(f"su -c 'cp -rf {src} {dst}'", shell=True, check=True)
-            subprocess.run(f"su -c 'chmod 777 {dst}'", shell=True, check=True)
-            subprocess.run(f"su -c 'chown root {dst}'", shell=True, check=True)
+            # one persistent-shell round-trip (was three separate su -c forks)
+            rc, out = rootshell.su_rc(
+                f"cp -rf {src} {dst} && chmod 777 {dst} && chown root {dst}")
+            if rc != 0:
+                Logger.error(f"{DEADNET_PREF}: sniff copy failed rc={rc} {out!r}")
+                return None
             return dst
         except Exception as exc:  # noqa: BLE001
             Logger.error(f"{DEADNET_PREF}: sniff copy failed {exc}")

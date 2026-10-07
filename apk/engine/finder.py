@@ -18,7 +18,8 @@ All privileged reads go through ``su -c "<cmd>"`` (matches
 pure function, ``parse_neigh_table``, so it is unit-testable without a
 device.
 
-Stdlib only: subprocess, threading, ipaddress, concurrent.futures, time, re.
+Stdlib only: threading, ipaddress, time, re. Privileged shell-outs go through
+the shared persistent root shell (engine.rootshell) — one su for the whole app.
 """
 from __future__ import annotations
 
@@ -28,8 +29,6 @@ import sys
 import time
 import threading
 import ipaddress
-import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, List, Optional, Sequence, Tuple
 
 # Make `import engine.*` work whether this module is imported as part of the
@@ -40,6 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from engine.contracts import (  # noqa: E402
     ScentRecord, NetInfo, ScanPhase, DB_KNOWN_SCENTS, now_ms,
 )
+from engine import rootshell as _root  # noqa: E402  (one persistent su)
 from engine import oui as _oui  # noqa: E402
 
 try:
@@ -69,27 +69,13 @@ def _log(msg: str) -> None:
 # pattern). Kept private to this unit per CONTRACTS.md rule #5.
 # ----------------------------------------------------------------------------
 def _su(cmd: str, timeout: float = 5.0) -> str:
-    """Run `cmd` as root via `su -c`. Returns stdout, or "" on any failure."""
-    try:
-        result = subprocess.run(
-            ["su", "-c", cmd], capture_output=True, text=True, timeout=timeout
-        )
-        if result.returncode != 0 and not result.stdout:
-            Logger.error(f"{DEADNET_PREF}: finder._su non-zero rc for {cmd!r}: {result.stderr!r}")
-        return result.stdout or ""
-    except Exception as e:
-        Logger.error(f"{DEADNET_PREF}: finder._su error for {cmd!r}: {e}")
-        return ""
-
-
-def _ping_once(ip: str) -> None:
-    """Fire-and-forget single ping to prime the kernel neighbour cache.
-    Result is intentionally discarded; we only care about the side effect
-    on `ip neigh`."""
-    try:
-        _su(f"ping -c1 -W1 {ip}")
-    except Exception:
-        pass
+    """Run `cmd` as root through the shared PERSISTENT root shell (one su for
+    the whole app — no per-call su fork). Returns merged stdout+stderr, or ""
+    on failure/timeout (rc == -1)."""
+    rc, out = _root.su_rc(cmd, timeout)
+    if rc != 0 and not out:
+        Logger.error(f"{DEADNET_PREF}: finder._su rc={rc} for {cmd!r}")
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -184,7 +170,8 @@ class Finder:
     writes go through the Arbiter into DB_KNOWN_SCENTS.
     """
 
-    PING_WORKERS = 32
+    PING_CHUNK = 64            # hosts pinged in parallel per su round-trip
+    PING_CHUNK_TIMEOUT = 8.0   # seconds to let one chunk's pings finish
 
     def __init__(self, arbiter, iface: str, net: NetInfo, on_progress=None):
         self.arbiter = arbiter
@@ -231,8 +218,10 @@ class Finder:
         """Signal smelling: cheap full inventory of the connected subnet.
 
         1. Seed from the existing ARP/ND cache (`ip neigh`).
-        2. Prime the cache with a bounded burst of `ping -c1 -W1` across
-           every host on the subnet (ThreadPoolExecutor, ~32 workers).
+        2. Prime the cache by pinging every host on the subnet, batched through
+           the PERSISTENT root shell: each chunk is ONE round-trip that pings
+           its whole batch in parallel (`ping -c1 -W1 & ... wait`). No per-host
+           su fork — the old 254×`su -c` storm was the "massive overhead".
         3. Re-read `ip neigh` and upsert everything learned.
         """
         # Step 1: seed from whatever the kernel already knows.
@@ -243,19 +232,14 @@ class Finder:
         total = len(targets) + 1  # +1 for the final re-read/upsert step
         self._progress(ScanPhase.P1_SMELL, 0, max(total, 1))
 
-        # Step 2: bounded parallel ping sweep to prime the neigh table.
+        # Step 2: batched ping sweep through the one su (chunked for a smooth
+        # progress bar; each chunk pings in parallel inside a single round-trip).
         done = 0
-        if targets:
-            workers = min(self.PING_WORKERS, len(targets))
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                futures = {ex.submit(_ping_once, ip): ip for ip in targets}
-                for fut in as_completed(futures):
-                    done += 1
-                    try:
-                        fut.result()
-                    except Exception:
-                        pass
-                    self._progress(ScanPhase.P1_SMELL, done, total)
+        for i in range(0, len(targets), self.PING_CHUNK):
+            batch = targets[i:i + self.PING_CHUNK]
+            _root.ping_sweep(batch, chunk=len(batch), timeout=self.PING_CHUNK_TIMEOUT)
+            done += len(batch)
+            self._progress(ScanPhase.P1_SMELL, done, total)
 
         # Step 3: re-read the now-primed neigh table, upsert everything.
         final_records = parse_neigh_table(self._read_neigh(), self.net.iface, _oui.classify)
@@ -383,9 +367,11 @@ class NetFetcher:
         if not self._in_focus():
             return  # this net isn't in the focus set this cycle; skip entirely
 
-        # Light re-ping of KNOWN hosts only (not a subnet sweep).
-        for ip in self._known_ips():
-            _ping_once(ip)
+        # Light re-ping of KNOWN hosts only (not a subnet sweep), batched into
+        # ONE persistent-shell round-trip instead of one su per host — this
+        # loop ran every mac_vacuum_interval_ms (default 1s), so per-host su
+        # forks here were a steady background drain.
+        _root.ping_sweep(self._known_ips(), chunk=64, timeout=6.0)
 
         # Re-read the neigh table and refresh last_seen/ip/lease fields.
         records = parse_neigh_table(_su(f"ip neigh show dev {self.iface}"),

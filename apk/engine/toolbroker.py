@@ -53,11 +53,10 @@ CAPABILITY_TOOLS: Dict[str, List[str]] = {
 
 
 def _su(cmd: str, timeout: float = 6.0) -> subprocess.CompletedProcess:
-    try:
-        return subprocess.run(["su", "-c", cmd], capture_output=True, text=True, timeout=timeout)
-    except Exception as e:
-        Logger.error(f"{DEADNET_PREF}: toolbroker _su error {e}")
-        return subprocess.CompletedProcess(cmd, 1, "", str(e))
+    """Resolve tools through the shared PERSISTENT root shell (one su for the
+    whole app). Returns a CompletedProcess; stdout carries merged output."""
+    from engine import rootshell as _root  # local import: avoid import cycles
+    return _root.su_cp(cmd, timeout)
 
 
 class ToolBroker:

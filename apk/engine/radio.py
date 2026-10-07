@@ -64,12 +64,11 @@ DEFAULT_MANAGED = "wlan0"     # Android's station iface / adb+tailscale control 
 
 
 def _su(cmd: str, timeout: float = 15.0) -> subprocess.CompletedProcess:
-    """Run a command under su. Never raises; returns a CompletedProcess."""
-    try:
-        return subprocess.run(["su", "-c", cmd], capture_output=True, text=True, timeout=timeout)
-    except Exception as e:  # noqa: BLE001
-        Logger.error(f"{DEADNET_PREF}: radio _su error {e}")
-        return subprocess.CompletedProcess(cmd, 1, "", str(e))
+    """Run a command as root through the shared PERSISTENT root shell (one su
+    for the whole app — no per-call su fork). Never raises; returns a
+    CompletedProcess whose stdout carries the merged stdout+stderr."""
+    from engine import rootshell as _root  # local import: avoid import cycles
+    return _root.su_cp(cmd, timeout)
 
 
 def _ok(cp: subprocess.CompletedProcess) -> bool:
@@ -234,7 +233,7 @@ class RadioController:
             _su(f"iw dev {self.mon_iface} del")
             add = _su(f"iw phy {phy} interface add {self.mon_iface} type monitor")
             if not _ok(add):
-                Logger.error(f"{DEADNET_PREF}: radio add {self.mon_iface} failed: {add.stderr.strip()}")
+                Logger.error(f"{DEADNET_PREF}: radio add {self.mon_iface} failed: {(add.stderr or add.stdout).strip()}")
                 self.state = CardState.ERROR
                 self.release_to_android()
                 return False

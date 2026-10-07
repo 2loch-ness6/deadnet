@@ -12,14 +12,14 @@ pattern in `apk/utils/net_utils.py`. Every parser below is a pure function
 over a text string so it is unit-testable off-device (see the self-test at
 the bottom of this file).
 
-Stdlib only: re, subprocess, ipaddress.
+Stdlib only: re, ipaddress. Privileged shell-outs go through the shared
+persistent root shell (engine.rootshell) — one su for the whole app.
 """
 from __future__ import annotations
 
 import os
 import re
 import sys
-import subprocess
 import ipaddress
 from typing import Dict, List, Optional, Tuple
 
@@ -60,17 +60,14 @@ _EXCLUDED_IFACE_PREFIXES = (
 # Privileged shell-out (matches apk/utils/net_utils.py's su pattern)
 # ----------------------------------------------------------------------------
 def _su(cmd: str, timeout: float = 5.0) -> str:
-    """Run `cmd` as root via `su -c`. Returns stdout, or "" on any failure."""
-    try:
-        result = subprocess.run(
-            ["su", "-c", cmd], capture_output=True, text=True, timeout=timeout
-        )
-        if result.returncode != 0 and not result.stdout:
-            Logger.error(f"{DEADNET_PREF}: iface._su non-zero rc for {cmd!r}: {result.stderr!r}")
-        return result.stdout or ""
-    except Exception as e:
-        Logger.error(f"{DEADNET_PREF}: iface._su error for {cmd!r}: {e}")
-        return ""
+    """Run `cmd` as root through the shared PERSISTENT root shell (one su for
+    the whole app — no per-call su fork). Returns merged stdout+stderr, or ""
+    on failure/timeout."""
+    from engine import rootshell as _root  # local import: avoid import cycles
+    rc, out = _root.su_rc(cmd, timeout)
+    if rc != 0 and not out:
+        Logger.error(f"{DEADNET_PREF}: iface._su rc={rc} for {cmd!r}")
+    return out
 
 
 # ----------------------------------------------------------------------------
