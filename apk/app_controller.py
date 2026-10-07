@@ -221,7 +221,11 @@ class AppController:
         self._netfetcher = NetFetcher(
             self.arbiter, self.managed_iface, self.net,
             interval_ms=self.knobs.mac_vacuum_interval_ms)
-        self._netfetcher.set_focus_nets([self.net.subnet_cidr or self.net.iface])
+        # NetFetcher gates its tick on `self.net.iface in focus`, so the focus
+        # set must be keyed by iface (the canonical net_id), NOT subnet_cidr —
+        # otherwise the membership test never matches and the mac-vacuum never
+        # runs.
+        self._netfetcher.set_focus_nets([self._attention_net_id()])
         self._netfetcher.start()
 
     def _run_scan(self) -> None:
@@ -328,7 +332,12 @@ class AppController:
                 return False
             our_mac = self._iface_mac(self.managed_iface)
             self._emission = EmissionController(self.arbiter, self.appdir, self.knobs)
-            self._emission.add_transmitter(self.managed_iface, self.net, our_mac=our_mac)
+            # Pin the transmitter's pump filter to the SAME net_id the attention
+            # rows carry (iface-keyed), so focused picks are not filtered out of
+            # the focus buffer.
+            self._emission.add_transmitter(
+                self.managed_iface, self.net, our_mac=our_mac,
+                net_id=self._attention_net_id())
             self._emission.start()  # also starts its own 100 ms rehydrator
 
             # feed the sniffer-sourced escaped-envelope counts into that rehydrator
@@ -370,6 +379,20 @@ class AppController:
         return {"tx_ps": tx, "leaking": leaking, "evidence": evidence,
                 "confirmed": confirmed, "targets": len(rows)}
 
+    def _attention_net_id(self) -> str:
+        """The canonical net_id used for attention rows AND the transmitter's
+        pump filter. It MUST match the convention the master store (scents) is
+        keyed by — the Finder writes `scents.net_id = self.net.iface`, select()
+        and the BirdObserver copy that through, and NetFetcher gates on
+        `self.net.iface in focus`. So the whole pipeline keys on the iface, NOT
+        subnet_cidr. Mixing the two silently drops rows from the emit focus set
+        (the pump filters attention `WHERE net_id = tx.net_id`), which is why a
+        focused fire used to leave the gauges flat — the picks carried the
+        iface-style net_id while the transmitter filtered on subnet_cidr."""
+        if self.net is None:
+            return self.managed_iface
+        return self.net.iface or self.managed_iface
+
     def _seed_targets(self, focused: bool) -> int:
         """Fill the attention/focus set so emit.cpp has something to aim at, and
         return the number of victim targets (excludes the gateway).
@@ -381,7 +404,7 @@ class AppController:
         victim-side poison; emit never victimizes it. Our own device is skipped."""
         if self.net is None:
             return 0
-        net_id = self.net.subnet_cidr or self.net.iface
+        net_id = self._attention_net_id()
         our_ip = self.net.device_ip or ""
         gw_ip = self.net.gateway_ipv4 or ""
         gw_mac = self.net.gateway_mac or ""
@@ -391,7 +414,15 @@ class AppController:
                 "INSERT OR REPLACE INTO attention(mac, ip, net_id, weight, pinned) "
                 "VALUES(?,?,?,?,1)", (gw_mac, gw_ip, net_id, 1.0))
         if focused:
-            # picks are already pinned in attention (sync, via select()); count them
+            # picks are already pinned in attention (sync, via select()). They
+            # carry the scent's net_id; normalize EVERY attention row to the
+            # transmitter's net_id so the emission pump's `WHERE net_id=?` filter
+            # includes them — otherwise emit has nothing to poison and the
+            # gauges read flat. One sync UPDATE at fire (not a hot path); all
+            # attention here belongs to the single connected net.
+            self.arbiter.write(
+                DB_ATTENTION, "UPDATE attention SET net_id=? WHERE net_id != ?",
+                (net_id, net_id))
             rows = self.arbiter.read(
                 DB_ATTENTION, "SELECT mac FROM attention WHERE mac != ?", (gw_mac,))
             return len(rows)
