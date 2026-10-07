@@ -120,8 +120,12 @@ class MainApp(MDApp):
             self.root.ids.scan_status.text = (
                 f"monitor smelling (offline) {data.get('elapsed')}/{data.get('total')}s")
         elif kind == "monitor_done":
+            hint = data.get("reconnect")
             self.root.ids.scan_status.text = (
-                f"deep smell done — {data.get('found', 0)} known")
+                f"deep smell done — {data.get('found', 0)} known"
+                + (f" · {hint}" if hint else ""))
+            if hint:
+                self._toast(hint)
             self.refresh_scents()
         elif kind in ("selected", "deselected", "selection_cleared"):
             self._refresh_sel_count()

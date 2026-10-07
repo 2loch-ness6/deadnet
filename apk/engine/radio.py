@@ -110,6 +110,7 @@ class RadioController:
         self._hop_thread: Optional[threading.Thread] = None
         self._hop_stop = threading.Event()
         self._guards_installed = False
+        self._seized_vifs: List[str] = []   # sibling vifs downed for a monitor seize
         # Clean networking baseline captured the first time we seize the radio,
         # reproduced on release so the owner's phone is "left how it was found".
         self._baseline: Optional[dict] = None
@@ -217,6 +218,23 @@ class RadioController:
                 _su("svc wifi enable")
 
     # -- RECON (monitor) ----------------------------------------------------
+    def _sibling_vifs(self) -> List[str]:
+        """Every wifi vif currently present (wlan0 / p2p0 / wifi-aware0 / ...),
+        excluding our own monitor vif. On this single-RF-chain phy a monitor
+        cannot coexist with ANY of them, so they must all be downed before the
+        monitor can tune (proven on CPH: `svc wifi disable` leaves p2p0 + NAN up
+        and the tune fails -16 busy until they are explicitly `ip link set down`)."""
+        try:
+            out = _su("iw dev")
+            names = re.findall(r"Interface\s+(\S+)", out.stdout or "")
+        except Exception:  # noqa: BLE001
+            names = []
+        seen = []
+        for n in names:
+            if n != self.mon_iface and n not in seen:
+                seen.append(n)
+        return seen or [self.managed_iface]
+
     def start_recon(self, channel: int = 6) -> bool:
         """Seize the radio into monitor mode on `channel`. PROVEN order 'B'."""
         with self._lock:
@@ -226,9 +244,16 @@ class RadioController:
             self.capture_baseline()           # snapshot "how it was found" first
             self.state = CardState.SEIZING
             phy = self.phy()
+            self._seized_vifs = self._sibling_vifs()   # remember to restore on release
             _su("svc wifi disable")
             time.sleep(2.0)                                    # let framework drop the link
-            _su(f"ip link set {self.managed_iface} down")
+            # Clear the whole RF chain: down EVERY sibling vif, not just wlan0 —
+            # p2p0 (managed) + wifi-aware0 (NAN) otherwise hold the radio and the
+            # monitor cannot tune (-16 busy). This is why mon mode regressed once
+            # the OEM dual-STA / Wi-Fi-Aware vifs became active.
+            for vif in self._seized_vifs:
+                _su(f"ip link set {vif} down")
+            _su(f"ip link set {self.managed_iface} down")      # belt-and-suspenders
             # fresh vif: delete any stale one first (idempotent)
             _su(f"iw dev {self.mon_iface} del")
             add = _su(f"iw phy {phy} interface add {self.mon_iface} type monitor")
@@ -251,7 +276,9 @@ class RadioController:
     def set_channel(self, channel: int) -> bool:
         cp = _su(f"iw dev {self.mon_iface} set channel {channel}")
         if not _ok(cp):
-            Logger.warning(f"{DEADNET_PREF}: set channel {channel} failed: {cp.stderr.strip()}")
+            # stderr is merged into stdout by the persistent root shell, so read both
+            Logger.warning(f"{DEADNET_PREF}: set channel {channel} failed: "
+                           f"{(cp.stderr or cp.stdout).strip()!r}")
         return _ok(cp)
 
     def start_hopping(self, channels: Optional[List[int]] = None, dwell_s: float = 0.25) -> None:
@@ -296,6 +323,12 @@ class RadioController:
                 self.state = CardState.RELEASING
             _su(f"iw dev {self.mon_iface} del")
             _su(f"ip link set {self.managed_iface} up")
+            # Bring the sibling vifs we downed for the seize back up, else the
+            # framework can be left with a DORMANT/NO-CARRIER wlan0 that never
+            # re-associates after a monitor interlude.
+            for vif in self._seized_vifs:
+                _su(f"ip link set {vif} up")
+            self._seized_vifs = []
             if was_seized:
                 # Force a disable->enable toggle: after recon the framework can still
                 # read wifi_on=1, so a bare `svc wifi enable` is a no-op and wlan0 never

@@ -269,6 +269,20 @@ class AppController:
                     self.radio.release_to_android(wait_reconnect=True)
                 except Exception:  # noqa: BLE001
                     pass
+        # Reconnect: on this phone, monitor churn in dual-STA/Wi-Fi-Aware mode
+        # wedges the framework's auto-join — svc/cmd/wpa_cli all fail to re-select
+        # the saved network; only an explicit connect (the Settings network tap)
+        # recovers it. So if release did not get us back on, pop the Android Wi-Fi
+        # panel for a one-tap manual rejoin instead of hanging on a dead auto-join.
+        if not self.radio.is_associated():
+            try:
+                from engine import rootshell
+                rootshell.su("am start -a android.settings.WIFI_SETTINGS")
+            except Exception:  # noqa: BLE001
+                pass
+            self.emit("monitor_done", found=len(self.scents()),
+                      reconnect="tap your Wi-Fi network to resume, then Smell/Fire")
+            return False
         # Back on the air: re-establish the normal associated/LOCKED state so the
         # monitor-captured scents are ready to FIRE. begin_smell re-discovers the
         # subnet, restarts the wired finder, and emits smelling/mode for the UI.
