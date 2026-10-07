@@ -198,17 +198,31 @@ class FinderAir:
     (owned by engine/radio.py). We only capture + parse + store.
     """
 
-    def __init__(self, arbiter, mon_iface: str, net_id: str = "air", on_scent=None):
+    def __init__(self, arbiter, mon_iface: str, net_id: str = "air", on_scent=None,
+                 bssid_filter: Optional[str] = None):
         self.arbiter = arbiter
         self.mon_iface = mon_iface
         self.net_id = net_id
         self.on_scent = on_scent
+        # When set, keep ONLY records belonging to this BSSID (the airspace we
+        # joined): our own AP (mac==bssid) and any station whose ap_bssid==bssid.
+        # Foreign APs/stations heard on the same channel are dropped so the
+        # master store stays scoped to "air we hold a key to".
+        self.bssid_filter = bssid_filter.lower() if bssid_filter else None
 
         self._proc: Optional[subprocess.Popen] = None
         self._thread: Optional[threading.Thread] = None
         self._stop_evt = threading.Event()
         self._running = False
         self._lock = threading.Lock()
+
+    def _in_airspace(self, rec) -> bool:
+        """True if `rec` belongs to the joined airspace (or no filter is set).
+        Our AP's beacons set ap_bssid to its own BSSID and each station carries
+        the BSSID it talks through, so a single ap_bssid==filter test covers both."""
+        if self.bssid_filter is None:
+            return True
+        return (rec.ap_bssid or "").lower() == self.bssid_filter
 
     # ------------------------------------------------------------- control
     def start(self) -> None:
@@ -285,6 +299,8 @@ class FinderAir:
                     _log(f"parse error: {exc}")
                     continue
                 for rec in recs:
+                    if not self._in_airspace(rec):
+                        continue  # outside the joined airspace — skip
                     rec.net_id = self.net_id
                     try:
                         upsert_scent(self.arbiter, rec)
@@ -383,6 +399,17 @@ def _self_test() -> None:
         assert sta_row[3] == 1, sta_row  # is_station True -> 1
 
         print("  [4] RowReaderArbiter round-trip: AP + station rows present  ok")
+
+        # 4b. bssid_filter scopes capture to the joined airspace -------------
+        ours = "aa:bb:cc:00:11:22"
+        fa_lock = FinderAir(arb, "mon0", net_id="wlan0", bssid_filter=ours)
+        assert all(fa_lock._in_airspace(r) for r in records), "our AP+station must pass"
+        fa_foreign = FinderAir(arb, "mon0", net_id="wlan0",
+                               bssid_filter="00:00:00:00:00:00")
+        assert not any(fa_foreign._in_airspace(r) for r in records), "foreign must drop"
+        fa_none = FinderAir(arb, "mon0", net_id="wlan0")  # no filter = keep all
+        assert all(fa_none._in_airspace(r) for r in records), "no filter keeps all"
+        print("  [4b] bssid_filter: joined airspace kept, foreign dropped  ok")
     finally:
         arb.close()
         try:

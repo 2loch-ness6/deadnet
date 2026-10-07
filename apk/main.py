@@ -111,6 +111,18 @@ class MainApp(MDApp):
         elif kind == "scan_done":
             self.root.ids.scan_status.text = "scan complete"
             self.refresh_scents()
+        elif kind == "monitor_smelling":
+            self.goto("scan")
+            self.root.ids.scan_status.text = (
+                f"monitor smell: ch{data.get('channel')} "
+                f"{data.get('bssid','')} — radio OFFLINE {data.get('dwell')}s")
+        elif kind == "monitor_progress":
+            self.root.ids.scan_status.text = (
+                f"monitor smelling (offline) {data.get('elapsed')}/{data.get('total')}s")
+        elif kind == "monitor_done":
+            self.root.ids.scan_status.text = (
+                f"deep smell done — {data.get('found', 0)} known")
+            self.refresh_scents()
         elif kind in ("selected", "deselected", "selection_cleared"):
             self._refresh_sel_count()
 
@@ -129,6 +141,16 @@ class MainApp(MDApp):
             return
         self._run(lambda: self.ctl.begin_smell(adhd=self.ctl.adhd),
                   "smelling the airspace…")
+
+    def on_deep_smell(self):
+        """2nd modality: monitor-mode sniff that sees through client isolation.
+        Drops the association for the sniff window (USB adb survives), then
+        reassociates. Runs on the _run worker thread (begin_monitor_smell blocks
+        for the dwell window and emits monitor_* progress)."""
+        if self.ctl is None:
+            return
+        self._run(lambda: self.ctl.begin_monitor_smell(),
+                  "deep smell: going offline to sniff…")
 
     def on_release(self):
         self._run(lambda: self.ctl.release(), "releasing radio to Android…")

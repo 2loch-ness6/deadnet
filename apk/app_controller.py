@@ -40,7 +40,9 @@ off-device. Stdlib + engine only.
 from __future__ import annotations
 
 import enum
+import re
 import threading
+import time
 from typing import Callable, List, Optional, Tuple
 
 try:
@@ -90,6 +92,7 @@ class AppController:
         # Detect/Smell flow state.
         self.airspaces_list: List[dict] = []   # associated airspaces last enumerated
         self.adhd: bool = False                # True => request a 2nd STA ("double guns")
+        self.monitor_dwell_s: float = 20.0     # deep (monitor) smell sniff window
         self.focused: bool = False             # FIRE fork: True=picked-only, False=whole
         self.links: dict = {}                  # post-associate link summary
 
@@ -105,6 +108,7 @@ class AppController:
         self._bird = None
         self._survival = None            # SurvivalMonitor (feeds the live gauges)
         self._survival_sample = None     # latest SurvivalSample
+        self._passive = None             # PassiveFinder (ARP-listen discovery during fire)
 
         self._lock = threading.RLock()
 
@@ -193,6 +197,84 @@ class AppController:
     # back-compat alias (older callers / tests)
     def connect(self, adhd: Optional[bool] = None) -> bool:
         return self.begin_smell(adhd=adhd)
+
+    # =======================================================================
+    # DEEP SMELL  (monitor-mode sniff interlude — sees through client isolation)
+    # =======================================================================
+    def _assoc_channel(self) -> Optional[int]:
+        """The channel wlan0 is currently associated on, parsed from `iw dev`.
+        Needed to tune the monitor to the joined airspace (we lock, never hop)."""
+        try:
+            from engine import rootshell
+            out = rootshell.su(f"iw dev {self.managed_iface} info") or ""
+        except Exception:  # noqa: BLE001
+            return None
+        m = re.search(r"channel\s+(\d+)", out)
+        return int(m.group(1)) if m else None
+
+    def begin_monitor_smell(self, dwell_s: Optional[float] = None) -> bool:
+        """The 2nd smell modality: briefly drop the association, seize the radio
+        into monitor on the JOINED channel, sniff 802.11 for `dwell_s` seconds
+        (attributing every heard device to its airspace by the BSSID in its
+        frames, filtered to the one we joined), then release + reassociate and
+        resume the normal associated/LOCKED state.
+
+        Unlike active smell this sees client-isolated devices, because monitor
+        reads the air directly instead of asking the router to forward packets.
+        It runs SYNCHRONOUSLY (callers run it on a worker); the radio is offline
+        for the sniff window (USB adb survives, Wi-Fi adb will drop)."""
+        dwell = self.monitor_dwell_s if dwell_s is None else float(dwell_s)
+        with self._lock:
+            bssid = (self.radio.is_associated() or "").strip()
+            ssid = self.radio.current_ssid()
+            if not bssid:
+                self.emit("error", msg="deep smell needs an association — Detect/Smell first")
+                return False
+            channel = self._assoc_channel() or 0
+            try:
+                self.radio.capture_baseline()   # so release restores how it was found
+            except Exception:  # noqa: BLE001
+                pass
+            self.emit("monitor_smelling", ssid=ssid, bssid=bssid, channel=channel,
+                      dwell=int(dwell), warn="radio offline during sniff")
+
+        air = None
+        seized = False
+        try:
+            if channel <= 0 or not self.radio.start_recon(channel):
+                self.emit("error", msg=f"could not seize monitor on ch{channel} (radio busy?)")
+                return False
+            seized = True
+            from engine.finder_air import FinderAir
+            air = FinderAir(self.arbiter, self.radio.mon_iface,
+                            net_id=self._attention_net_id(), bssid_filter=bssid)
+            air.start()
+            t0 = time.time()
+            while True:
+                elapsed = time.time() - t0
+                if elapsed >= dwell:
+                    break
+                self.emit("monitor_progress", elapsed=int(elapsed), total=int(dwell))
+                time.sleep(min(1.0, dwell - elapsed))
+        except Exception as exc:  # noqa: BLE001
+            self.emit("error", msg=f"deep smell failed: {exc}")
+        finally:
+            if air is not None:
+                try:
+                    air.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+            if seized:
+                try:
+                    self.radio.release_to_android(wait_reconnect=True)
+                except Exception:  # noqa: BLE001
+                    pass
+        # Back on the air: re-establish the normal associated/LOCKED state so the
+        # monitor-captured scents are ready to FIRE. begin_smell re-discovers the
+        # subnet, restarts the wired finder, and emits smelling/mode for the UI.
+        ok = self.begin_smell(adhd=self.adhd)
+        self.emit("monitor_done", found=len(self.scents()))
+        return ok
 
     def _link_summary(self, wanted_second: bool) -> dict:
         """Describe the associated link(s) and which mode we actually got."""
@@ -358,6 +440,13 @@ class AppController:
             # focus set, so the gauges work in focused AND unfocused fire.
             self._start_survival(our_mac)
 
+            # Passive discovery: listen to ARP on the associated link while we
+            # fire. ARP is link-layer broadcast (reaches us even under client
+            # isolation that silently drops active probes), and the poison
+            # provokes victims to re-ARP — so the attack itself populates the
+            # electronic list with hosts active smell could never knock awake.
+            self._start_passive()
+
             if self.knobs.bird_airborne:
                 self._bird = BirdObserver(self.arbiter, self.knobs)
                 self._bird.start()
@@ -495,6 +584,18 @@ class AppController:
             Logger.error(f"{DEADNET_PREF}: sniff copy failed {exc}")
             return None
 
+    def _start_passive(self) -> None:
+        """Start the ARP-listen passive finder on the associated link (discovery
+        that works under client isolation). Best-effort: a failure never blocks fire."""
+        try:
+            from engine.finder_passive import PassiveFinder
+            self._passive = PassiveFinder(
+                self.arbiter, self.managed_iface, net_id=self._attention_net_id())
+            self._passive.start()
+        except Exception as exc:  # noqa: BLE001
+            Logger.error(f"{DEADNET_PREF}: passive finder failed to start {exc}")
+            self._passive = None
+
     def _on_survival(self, sample) -> None:
         self._survival_sample = sample
 
@@ -515,7 +616,7 @@ class AppController:
 
     def cease(self) -> None:
         with self._lock:
-            for svc in ("_bird", "_rsm", "_emission", "_survival"):
+            for svc in ("_bird", "_rsm", "_emission", "_survival", "_passive"):
                 obj = getattr(self, svc, None)
                 if obj is not None:
                     try:
@@ -577,7 +678,8 @@ if __name__ == "__main__":
 
     # stub the radio + engine services so nothing touches a device
     class _FakeRadio:
-        def __init__(self): self.state = CardState.ANDROID
+        mon_iface = "mon0"
+        def __init__(self): self.state = CardState.ANDROID; self.recon_ch = None
         def ensure_managed(self, **k): self.state = CardState.MANAGED; return True
         def is_associated(self): return "aa:bb:cc:dd:ee:ff"
         def release_to_android(self, **k): self.state = CardState.ANDROID; return True
@@ -587,6 +689,7 @@ if __name__ == "__main__":
         def capture_baseline(self): return {}
         def restore_baseline(self): pass
         def set_dual_sta(self, on): pass
+        def start_recon(self, channel=6): self.state = CardState.MONITOR; self.recon_ch = channel; return True
     ctl.radio = _FakeRadio()
 
     _NET = NetInfo(iface="wlan0", device_ip="192.168.1.50", cidr=24,
@@ -623,6 +726,17 @@ if __name__ == "__main__":
     import engine.birdobserver as _bo
     _em.EmissionController = _FakeEmission
     _bo.BirdObserver = _FakeBird
+
+    # passive ARP finder + monitor-mode air finder: stub so no real `su`/tcpdump
+    class _FakeCapture:
+        started = []
+        def __init__(self, *a, **k): self.a = a; self.k = k; self._on = False
+        def start(self): self._on = True; _FakeCapture.started.append(self.k.get("net_id") or self.a)
+        def stop(self): self._on = False
+    import engine.finder_passive as _fp
+    import engine.finder_air as _fa
+    _fp.PassiveFinder = _FakeCapture
+    _fa.FinderAir = _FakeCapture
     # survival monitor is imported lazily inside _start_survival; stub the module
     import sys as _sys
     import types as _types
@@ -671,8 +785,11 @@ if __name__ == "__main__":
     victims = [r["mac"] for r in ctl.selected() if r["mac"] != "aa:bb:cc:00:00:01"]
     assert len(victims) == 3, victims
     assert ctl._emission.blind == "192.168.1.0/24", "unfocused must blast whole subnet blind"
+    assert "wlan0" in _FakeCapture.started, "passive ARP finder must ride along during fire"
+    assert ctl._passive is not None, "passive finder must be live while firing"
     ctl.cease()
     assert ctl.mode == Mode.LOCKED
+    assert ctl._passive is None, "cease() must stop the passive finder"
 
     # 6) FOCUSED fire: only the owner's picks seed the set
     ctl.clear_selection()
@@ -686,6 +803,20 @@ if __name__ == "__main__":
     # 7) FOCUSED with no picks is refused (nothing to aim at)
     ctl.clear_selection()
     assert ctl.fire(focused=True) is False
+
+    # 8) DEEP (monitor) SMELL: seize monitor on the joined channel, sniff, release,
+    #    reassociate, and come back LOCKED and ready to fire.
+    ctl._assoc_channel = lambda: 11          # avoid touching a real `iw`
+    _FakeCapture.started = []
+    mon_events = []
+    _prev_emit = ctl._emit
+    ctl._emit = lambda k, d: (mon_events.append(k), _prev_emit(k, d))
+    assert ctl.begin_monitor_smell(dwell_s=0) is True
+    assert ctl.radio.recon_ch == 11, "monitor must lock to the joined channel"
+    assert ctl.mode == Mode.LOCKED, "deep smell must leave us ready to fire"
+    assert "monitor_smelling" in mon_events and "monitor_done" in mon_events, mon_events
+    assert _FakeCapture.started, "monitor sniff (FinderAir) must have started"
+    ctl._emit = _prev_emit
 
     # 8) release -> IDLE, radio handed back
     ctl.release()
