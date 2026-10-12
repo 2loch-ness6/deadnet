@@ -388,6 +388,12 @@ warn_on_root = 1
 #[app:source.exclude_patterns@demo]
 #images/hd/*
 #
+#    Mgmt port variant: side-by-side with the ARP builds (org.deadnet.deadnet).
+#    Build with: buildozer --profile mgmt android debug
+[app@mgmt]
+title = Deadnet Mgmt
+package.name = deadnetmgmt
+#
 #    Then, invoke the command line with the "demo" profile:
 #
 #buildozer --profile demo android debug
