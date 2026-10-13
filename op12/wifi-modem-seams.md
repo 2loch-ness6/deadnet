@@ -678,3 +678,50 @@ guards, TX cookie decoding, strict freq parsing (0 still passes through to the
 kernel's EINVAL), `--help`/`--wait N` flags. Output contract unchanged
 (`RESULT|TXSTATUS|bad hexframe|no such iface`), verified on-air (B0 baseline
 accepted + TXSTATUS, cookie=0x108; `--fast` path clean).
+
+---
+
+## PERSISTENT PARTITION FLASH — patched cfg80211 in `vendor_dlkm_b` (2026-10-12/13)
+
+Supersedes the Magisk bind-mount delivery above. The patched `cfg80211.ko` (the
+two neutralised mlme gates: STA/non-public-action at `mlme.c:766`, SA
+anti-spoof at `mlme.c:822`) is now written directly into the `vendor_dlkm_b`
+partition with verity disabled, so it loads on every boot with no runtime
+bind-mount.
+
+Flash + boot (lh-laptop/loch-nuc):
+- `vendor_dlkm_b` resized + written; `vbmeta_b` (verity-disabled) written.
+- Boot `sys.boot_completed=1` in ~18 s, active slot `_b`, no bootloop.
+- `adb reboot fastboot` -> fastbootd works for logical-partition flash; the
+  earlier "fastboot broken" was only the key-combo bootloader-mode path.
+
+On-device state after boot (verified 2026-10-13):
+- Kernel base is now **`6.1.118-android14-11-o-g818f2506c9e7`** (the earlier
+  notes were written against `6.1.57` — refresh references).
+- `/vendor_dlkm/lib/modules/cfg80211.ko` vermagic
+  **`6.1.118-android14-11-o-maybe-dirty`** (patched build; 2 067 752 B).
+- `cfg80211` loaded with `holders … 2 qca_cld3_kiwi_v2,mac80211`.
+- **CRC gate held:** `mac80211`, `qca_cld3_kiwi_v2`, `bluetooth`, `nfc`,
+  `rfkill` all loaded against the patched module — zero symbol drift.
+- WiFi STA enabled (`wlan0` = 192.168.1.173), BT + NFC up, no module
+  unknown-symbol / disagrees-about-version errors. Verity disabled (the
+  modified vendor_dlkm mounts).
+
+Functional proof (non-disruptive, 2026-10-13, SELinux **Enforcing**, magisk
+root, `wlan0` MAC `2a:b9:96:ac:74:18`, on-channel 5220 MHz; vendored
+`nl80211_inject.arm64`):
+- default vendor action -> accepted + `FRAME_TX_STATUS` (baseline path).
+- **spoofed-SA** public action (cat 04, bogus DA/BSSID) -> accepted + TXSTATUS
+  (stock: `EINVAL` @ `mlme.c:822`).
+- **non-public** action (cat 00, BSSID != our AP) -> accepted + TXSTATUS
+  (stock: `ENOTCONN` @ `mlme.c:766`).
+Both gates therefore neutralised end-to-end on the persistent flash.
+
+Recovery: GOLDEN + stock vbmeta staged on loch-nuc -> two-command `fastboot`
+rollback to 100 % stock + verity.
+
+App integration: the Android-namespace harness for this (`apk/engine/mgmt_tx.py`
++ `apk/engine/phycycle.py`, built as the side-by-side `org.deadnet.deadnetmgmt`
+APK) is tracked on branch `feature/mgmt-replace-arp`; see `apk/MGMT_PORT.md`.
+Roadmap there: build full mgmt-path support into DeadNet (selectable ARP vs
+mgmt emission backend).

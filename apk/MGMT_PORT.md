@@ -1,9 +1,10 @@
 # DeadNet — mgmt-TX port (branch `feature/mgmt-replace-arp`)
 
-State as of **2026-10-12**. Branch cut from `feature/multi-card-redesign`
+State as of **2026-10-13**. Branch cut from `feature/multi-card-redesign`
 (tip `536e20c`). Goal: replace DeadNet's ARP-based emission with 802.11
 management-frame injection (cfg80211 `NL80211_CMD_FRAME`), orchestrated by an
-Android-namespace harness that owns the single `phy0` cycle.
+Android-namespace harness that owns the single `phy0` cycle, and **build full
+support for the mgmt path into DeadNet itself** (see *Roadmap*).
 
 ## Why
 
@@ -58,10 +59,48 @@ GHz, on-air deauth confirmed by an external AP reaction. It needs only
 
 ### Device
 
-* Built APK installed on CPH2581 via `adb connect 100.87.236.24:5555`.
-  Verified in `assets/private.tar`: `engine/mgmt_tx.pyc`,
-  `engine/phycycle.pyc`, `assets/nl80211_inject.*`.
-  Smoke-launched: process up, `PythonActivity` resumed, no Python errors.
+* Built APK installed on CPH2581 via `adb connect` (tailnet IP rotates on
+  reboot; current `100.84.93.116:5555`). Verified in `assets/private.tar`:
+  `engine/mgmt_tx.pyc`, `engine/phycycle.pyc`,
+  `assets/nl80211_inject.*`. Smoke-launched: process up, `PythonActivity`
+  resumed, no Python errors.
+* **Device base moved to kernel `6.1.118-android14-11-o-g818f2506c9e7`** (the
+  `op12/` notes were written against `6.1.57`; refresh them to this base).
+
+## Persistent flash milestone — gates live on every boot (2026-10-12/13)
+
+The two `cfg80211` mlme gates we were previously neutralising at runtime
+(`mlme.c:766` STA/non-public-action check and `mlme.c:822` SA anti-spoof) are
+now **permanently flashed** into the `vendor_dlkm_b` partition, with verity
+disabled, so the patched module loads on every boot and the whole dependent
+stack works normally.
+
+| check | result |
+|---|---|
+| Flash | `vendor_dlkm_b` resized + written, `vbmeta_b` (verity-disabled) written |
+| Boot | `sys.boot_completed=1` in ~18 s, slot `_b`, no bootloop |
+| Patched module | `/vendor_dlkm/lib/modules/cfg80211.ko` vermagic `6.1.118-android14-11-o-maybe-dirty` |
+| Loaded at boot | `cfg80211 … 2 qca_cld3_kiwi_v2,mac80211` |
+| CRC gate held | mac80211, qca_cld3, bluetooth, nfc, rfkill all loaded against the patched cfg80211 — zero symbol drift |
+| Radios | WiFi STA enabled (`wlan0=192.168.1.173`), BT + NFC up |
+| Verity | disabled (modified vendor_dlkm mounts) |
+| Module errors | none (no unknown-symbol / disagrees-about-version) |
+
+### Functional proof (non-disruptive, run 2026-10-13)
+
+Injected from the STA on-channel (5220 MHz, SELinux **Enforcing**, magisk root;
+`wlan0` MAC `2a:b9:96:ac:74:18`) with the vendored `nl80211_inject.arm64`:
+
+| # | frame | stock behaviour | observed | verdict |
+|---|-------|-----------------|----------|---------|
+| 1 | default vendor action | accepted | accepted + `FRAME_TX_STATUS` | baseline TX path live |
+| 2 | spoofed-SA public action (cat 04), bogus DA/BSSID | `EINVAL` @ `mlme.c:822` | accepted + TXSTATUS | SA anti-spoof gate neutralised |
+| 3 | non-public action (cat 00), BSSID ≠ our AP | `ENOTCONN` @ `mlme.c:766` | accepted + TXSTATUS | action/AP gate neutralised |
+
+Recovery stays intact: GOLDEN + stock vbmeta are staged on `loch-nuc`, so a
+two-command `fastboot` rollback restores 100 % stock + verity any time.
+`adb reboot fastboot` → fastbootd (logical-partition flash) works; the earlier
+"fastboot broken" was only the key-combo bootloader-mode path.
 
 ## Build recipe (host)
 
@@ -81,7 +120,10 @@ buildozer --profile mgmt android debug
 Storage dir is `/srv/deadnet-build/dot-buildozer` (kept off the ~2 GB root fs);
 the in-repo `apk/.buildozer` is effectively empty. Gradle tasks run under JDK 17.
 
-## What is NOT done (next)
+## Roadmap — build full support into DeadNet
+
+The end goal is not just a validating harness: the mgmt path becomes a
+first-class emission backend in the app.
 
 1. **UI wiring.** `apk/main.py` / `app_controller.py` still drive the ARP path.
    FIRE must route to `PhyCycle` (single-target `13 <atk>`) / spoof-set
@@ -90,9 +132,11 @@ the in-repo `apk/.buildozer` is effectively empty. Gradle tasks run under JDK 17
 2. **Retire ARP behind a knob.** `apk/src/emit.cpp` / `arp.cpp` /
    `nra.cpp` and the survival `sniff` gauges stay compiled but default off;
    `PassiveFinder` + `BirdObserver` re-fed from mgmt `TXSTATUS`.
-3. **Strip the injector assets** (currently ~3 MB each with debug_info).
-4. **On-device validation** of the harness end-to-end: `phycycle.doctor`
-   then `doctor`-disruptive (own-AP only), through the installed variant.
+3. **Make the emission backend selectable** (ARP vs mgmt) so the ARP path
+   remains available where the patched module is not present.
+4. **Strip the injector assets** (currently ~3 MB each with debug_info).
+5. **On-device validation** of the harness end-to-end through the installed
+   variant: `phycycle.doctor`, then opt-in disruptive self-deauth (own AP only).
 
 ## Known constraints / caveats (from `op12/wifi-modem-seams.md`)
 

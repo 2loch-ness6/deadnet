@@ -10,6 +10,16 @@ metadata:
 
 Status of the OP12 Docker-kernel build as of 2026-09-16 (may be stale — verify).
 
+> **[ 2026-10-13 PIVOT ]** The live thread is no longer the Docker kernel: the
+> device now runs kernel **`6.1.118-android14-11-o-g818f2506c9e7`** with a
+> **patched `cfg80211.ko` permanently flashed into `vendor_dlkm_b`** (verity
+> disabled), loaded at every boot with the full WiFi/BT/NFC stack intact — both
+> mlme injection gates proven neutralised on-air (see
+> [[wifi-modem-seams]] "PERSISTENT PARTITION FLASH"). The app-side mgmt-TX
+> harness (`apk/engine/mgmt_tx.py` + `phycycle.py`, branch
+> `feature/mgmt-replace-arp`) is the path to building full mgmt support into
+> DeadNet. The Docker-kernel content below is retained as history.
+
 ⛔ **OVERNIGHT HOLD (2026-09-16, user went to bed):** NO FLASHING until the user is back and gives explicit go. lh-laptop hard-holding. Phone stays on C6 (working Docker-config kernel). **UPDATE: C8 gate ran overnight → FAILED (see below). C8 is NOT flashable. C6 remains the only proven flash-ready artifact — nothing to flash even if asked; the pass-2 builtin approach is a dead end.**
 
 **❌ C8 FAILED CRC GATE — ROOT CAUSE = struct net has no KABI padding (2026-09-16 03:37, RC=0 real build, IP_VS confirmed removed).** C8 = C7 minus IP_VS. Gate STILL 451 imported-symbol drifts (identical class to C7): init_task 0xab7c9c2b≠0xd567d551, __task_pid_nr_ns, register_netdevice, _dev_printk (struct device!), __alloc_skb/build_skb (sk_buff), wall of netdev/sock. All 5 held in C6 → C8 broke them. Dropping IP_VS did NOTHING because IP_VS was never the (only) culprit. REAL culprit: the NAT/masquerade configs pulled in **CONFIG_NF_CONNTRACK=y** (+ EVENTS/PROCFS/helpers) which adds `struct netns_ct ct` to **struct net**. struct net has **ZERO ANDROID_KABI_RESERVE slots** (common/include/net/net_namespace.h ends flat at line 430) → cannot pad → the struct net layout shift ripples via genksyms through everything transitively referencing it (task_struct via nsproxy→net, net_device, sk_buff via _nfct, struct device). NF_TABLES/BRIDGE_NETFILTER didn't even enable (dep). Stock exports only 3 conntrack HOOK stubs (nf_ct_attach/nf_conntrack_destroy/nf_ct_delete via indirection) — it does NOT ship full builtin conntrack, so our netns_ct enlargement always drifts. **CONCLUSION: builtin conntrack/NAT/nftables is structurally OFF THE TABLE on this KMI (unpaddable struct net). Pass-2 "full container networking as builtin" is dead.** Container NAT must come another way — investigate w/ user: (a) does stock already have enough via iptables-legacy + existing IP_NF_NAT/MASQUERADE (stock gki_defconfig already has IP_NF_IPTABLES/IP_NF_NAT/IP_NF_TARGET_MASQUERADE/NF_CONNTRACK per prior analysis — RE-VERIFY on-device, C6 may already do docker0 NAT!), (b) userspace-only (kali's containerd/runc mount-propagation fix is the actual blocker, NOT the kernel). LESSON: before adding ANY netfilter config, grep it as a #if guard against struct net / netns_* AND sk_buff/task_struct, and confirm the target struct has reserve slots — struct net does NOT.
