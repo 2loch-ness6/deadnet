@@ -214,3 +214,60 @@ Rework the existing three screens to the new flow (keep framework/theme):
   fallback — decide after M2 measurements.
 * **Open:** keep the CLI `deadnet.py`? keep any L3/subnet features? move
   removed code to a `legacy/` tag vs rely on branch history?
+
+---
+
+## 15. Groundwork status (MVP handoff)
+
+Branch `feature/v3-phy-ownership`. The **new engine layer is built and green**;
+the teardown + UI rewire (which touch the live app) are left for the next pass.
+
+### Done — new modules, each with an off-device `__main__` self-test
+
+| Commit | Module | Self-test | What it owns |
+|--------|--------|-----------|--------------|
+| `5138913` | `engine/phyguard.py` (+ `contracts.Ownership/PhyMode`) | `PHYGUARD PASS` | Binary PHY ownership; `own()` / `to_attack()` / `to_recon()` / `release()`; Android lock-out guard loop; guaranteed release |
+| `1ca0793` | `engine/recon.py` | `RECON PASS` | Standalone monitor 802.11 parser, `Target` + thread-safe `TargetStore`, `ReconScanner` (tcpdump capture → parse → store) |
+| `af95fb0` | `engine/attack.py` | `ATTACK PASS` | recon→`MgmtTarget` adapter, selection (`3` / `1,3` / `S<glob>` / `S~<ere>` / `all`), NUKE spoof set, scheduler, `AttackController` |
+| `af95fb0` | `engine/capgate.py` | `CAPGATE PASS` | Patched-cfg80211 gate (spoofed-SA probe; vermagic fallback) |
+
+Unchanged foundations still green: `mgmt_tx.py` (`MGMT_TX PASS`),
+`radio.py` (`U6 PASS`).
+
+### Execution-order note (differs from §12)
+
+Built the new modules **before** the teardown so the tree never goes import-broken.
+M0 (teardown) and M4 (UI rewire) therefore come *after* M1–M3, once the
+replacements exist.
+
+### Found + fixed
+
+The scheduler lifted out of `phycycle.py` never advanced its index — it always
+fired at `spoof[0]`, so multi-target selection silently only ever hit the first
+target. Fixed in `attack.py` (`idx += 1`, channel-sticky rotation). `phycycle.py`
+still carries the bug and is slated for deletion in M0.
+
+### Left to do (the "rest")
+
+* **M0 teardown** — delete `apk/engine/{emission,birdobserver,finder,finder_passive,
+  finder_air,portscan,phycycle}.py`, `apk/survival_monitor.py`, `apk/src/{emit,arp,
+  nra,sniff,synscan}.cpp`, and their `apk/assets/*` binaries; then excise every
+  reference in `app_controller.py` + `main.py`.
+* **M4 UI rewire** — `app_controller.py` becomes the ANDROID↔APP{RECON,ATTACK}
+  state machine driving `PhyGuard`/`ReconScanner`/`AttackController`/`CapGate`;
+  `main.py`+`main.kv` rework to Recon / Select / Attack with `TXSTATUS` gauges.
+* **M5 packaging** — `[app@v3]` profile → `org.deadnet.deadnet3`.
+* **M6 on-device** — `capgate` probe; RECON sees a known AP; ATTACK acceptance +
+  `TXSTATUS` on a bogus/local target; release restores Wi-Fi + baseline.
+
+### Wiring seams (where the app plugs into the new modules)
+
+* `PhyGuard(managed_iface, mon_iface)` → `own(ch)` / `to_attack()` / `to_recon(ch)`
+  / `release()` / `guard()`.
+* `ReconScanner(mon_iface, store, on_target, set_channel=phyguard.radio.set_channel)`
+  → `start()` / `stop()`; read `store.snapshot()`.
+* `select_spoof([from_recon(t) for t in store.snapshot()], spec)` → `spoof` list;
+  `build_spoof_set(...)` for NUKE.
+* `AttackController(mgmt_tx.send, ensure_attack=phyguard.to_attack)` →
+  `run(AttackPlan(...), ctx, on_tick=...)`.
+* `CapGate(iface, tx_send=mgmt_tx.send).check()` → `CapResult`.
