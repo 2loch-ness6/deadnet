@@ -69,6 +69,19 @@ class CardState(enum.Enum):
     ERROR = "error"
 
 
+# --- v3: PHY ownership model ------------------------------------------------
+class Ownership(enum.Enum):
+    """Who owns the single Wi-Fi PHY. The binary state of the v3 app."""
+    ANDROID = "android"      # baseline: the framework owns the radio
+    APP = "app"              # the app owns the PHY and guards it from Android
+
+
+class PhyMode(enum.Enum):
+    """The one mode the PHY sits in while `Ownership.APP` holds it."""
+    RECON = "recon"          # monitor vif (mon0) — passive target detection
+    ATTACK = "attack"        # managed vif (wlan0), UNASSOCIATED — mgmt-TX injection
+
+
 # ----------------------------------------------------------------------------
 # Hardware / capability model  (U0 records this; U1 parses it)
 # ----------------------------------------------------------------------------
