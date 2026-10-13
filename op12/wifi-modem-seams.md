@@ -715,7 +715,17 @@ root, `wlan0` MAC `2a:b9:96:ac:74:18`, on-channel 5220 MHz; vendored
   (stock: `EINVAL` @ `mlme.c:822`).
 - **non-public** action (cat 00, BSSID != our AP) -> accepted + TXSTATUS
   (stock: `ENOTCONN` @ `mlme.c:766`).
-Both gates therefore neutralised end-to-end on the persistent flash.
+- **blocked subtype** (assoc-resp from a STA vif, real SA) -> accepted +
+  TXSTATUS (stock: `EINVAL` @ the TX-subtype mask).
+
+So **three** checks are neutralised: the STA/non-public address carve-out
+(`mlme.c:766`), the SA anti-spoof (`cfg80211_allowed_address`, `mlme.c:822`),
+and the TX-subtype mask (`wiphy->mgmt_stypes[iftype].tx & BIT(stype >> 4)`).
+The first two were runtime-verified earlier; the third came from an independent
+netlink-tester run in the Kali chroot (root over USB), which also confirmed all
+three gate checks are present in **stock**'s disassembly. All test frames were
+single and addressed to non-existent locally-administered MACs on our own
+channel — nothing real was affected.
 
 Recovery: GOLDEN + stock vbmeta staged on loch-nuc -> two-command `fastboot`
 rollback to 100 % stock + verity.

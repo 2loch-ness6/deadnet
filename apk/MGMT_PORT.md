@@ -95,7 +95,22 @@ Injected from the STA on-channel (5220 MHz, SELinux **Enforcing**, magisk root;
 |---|-------|-----------------|----------|---------|
 | 1 | default vendor action | accepted | accepted + `FRAME_TX_STATUS` | baseline TX path live |
 | 2 | spoofed-SA public action (cat 04), bogus DA/BSSID | `EINVAL` @ `mlme.c:822` | accepted + TXSTATUS | SA anti-spoof gate neutralised |
-| 3 | non-public action (cat 00), BSSID ≠ our AP | `ENOTCONN` @ `mlme.c:766` | accepted + TXSTATUS | action/AP gate neutralised |
+| 3 | non-public action (cat 00), BSSID ≠ our AP | `ENOTCONN` @ `mlme.c:766` | accepted + TXSTATUS | action/AP address gate neutralised |
+| 4 | assoc-resp from a STA vif (blocked subtype), real SA | `EINVAL` @ tx-subtype mask | accepted + TXSTATUS | TX-subtype mask gate neutralised |
+
+An **independent** netlink tester run from the Kali chroot
+(`/tmp/.../nl80211_frametest.py`, root over USB) reproduced the same three
+gate-bypass cases against bogus locally-administered addrs on-channel, and
+confirmed both gated checks are compiled into **stock**'s disassembly:
+
+* **SA anti-spoof** — `cfg80211_allowed_address()` (the gate at `mlme.c:822`).
+* **TX-subtype mask** — `wiphy->mgmt_stypes[iftype].tx & BIT(stype >> 4)`,
+  i.e. a vdev only permits the mgmt subtypes its driver advertises for TX.
+
+So the patch neutralises three checks in total: the STA/non-public address
+carve-out (`mlme.c:766`), the SA anti-spoof (`mlme.c:822`), and the TX-subtype
+mask. All three frames were single, addressed to non-existent
+locally-administered MACs on the current channel — nothing real was affected.
 
 Recovery stays intact: GOLDEN + stock vbmeta are staged on `loch-nuc`, so a
 two-command `fastboot` rollback restores 100 % stock + verity any time.

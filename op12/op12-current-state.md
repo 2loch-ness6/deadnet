@@ -13,8 +13,9 @@ Status of the OP12 Docker-kernel build as of 2026-09-16 (may be stale — verify
 > **[ 2026-10-13 PIVOT ]** The live thread is no longer the Docker kernel: the
 > device now runs kernel **`6.1.118-android14-11-o-g818f2506c9e7`** with a
 > **patched `cfg80211.ko` permanently flashed into `vendor_dlkm_b`** (verity
-> disabled), loaded at every boot with the full WiFi/BT/NFC stack intact — both
-> mlme injection gates proven neutralised on-air (see
+> disabled), loaded at every boot with the full WiFi/BT/NFC stack intact — all
+> three injection gates (SA anti-spoof, TX-subtype mask, STA/non-public
+> address carve-out) proven neutralised on-air (see
 > [[wifi-modem-seams]] "PERSISTENT PARTITION FLASH"). The app-side mgmt-TX
 > harness (`apk/engine/mgmt_tx.py` + `phycycle.py`, branch
 > `feature/mgmt-replace-arp`) is the path to building full mgmt support into
