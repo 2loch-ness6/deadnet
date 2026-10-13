@@ -1,15 +1,19 @@
 """
-DeadNet — single-radio, 2-preset redesign (PR #2) UI.
+DeadNet v3 — own-the-PHY UI (Kivy/KivyMD 1.2.0 shell).
 
-Three nav sections (owner's convention): Detect & Connect / Scan & Select /
-Configure & Trigger. Two presets on the one internal radio:
-  RECON & RECORD -> monitor + air sniff;  LOCK & LEVEL -> associate + focused fire.
+Three sections drive the ANDROID<->APP{RECON,ATTACK} state machine in
+AppController (app_controller.py):
 
-This file is the thin Kivy/KivyMD 1.2.0 shell. All orchestration lives in
-AppController (app_controller.py), which drives the engine/ layer. Release-back of
-the radio to Android is guaranteed (RadioController atexit/signal + on_stop()).
+  RECON   — OWN PHY (seize monitor, Android guarded) + live target inventory;
+            CapGate status; RELEASE.
+  SELECT  — pick targets (single / comma / S<pattern>) against the recon list.
+  ATTACK  — mode picker (1-12 + NUKE) + pps; FIRE/STOP; live TXSTATUS gauges
+            (frames SENT, ACCEPTED by the kernel, target PPS).
+
+Thin shell: all orchestration + device calls live in AppController / engine.
+Release-back of the PHY to Android is guaranteed (PhyGuard atexit/signal +
+on_stop()).
 """
-import dataclasses
 import subprocess
 import threading
 import traceback
@@ -21,11 +25,11 @@ from kivy.logger import Logger, LOG_LEVELS
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
 from kivy.uix.button import Button
-from kivy.uix.textinput import TextInput
 from kivymd.toast.kivytoast import toast
 
 from gauge import Gauge  # noqa: F401  (registers <Gauge> for main.kv)
-from app_controller import AppController, Mode, EmitMode
+from app_controller import AppController, AppState
+from engine.attack import ATTACK_MODES
 
 try:
     from jnius import autoclass  # noqa: F401  (present only on-device)
@@ -36,8 +40,11 @@ except Exception:
 Logger.setLevel(LOG_LEVELS["info"])
 DEADNET_PREF = "DeadNet"
 
-# knobs we never auto-render (derived/managed by the controller)
-_KNOB_SKIP = {"emit_mode", "scan_phases"}
+NUKE_LABEL = "NUKE (wildcard deauth/disassoc)"
+# spinner label -> attack-mode id (0 = NUKE)
+_MODE_BY_LABEL = {ATTACK_MODES[i]: i for i in sorted(ATTACK_MODES)}
+_MODE_BY_LABEL[NUKE_LABEL] = 0
+_MODE_LABELS = [ATTACK_MODES[i] for i in sorted(ATTACK_MODES)] + [NUKE_LABEL]
 
 
 class MainApp(MDApp):
@@ -45,8 +52,7 @@ class MainApp(MDApp):
         super().__init__(**kwargs)
         self.ctl = None
         self._root_ok = self._try_root()
-        self._peaks = {"tx": 1.0, "surv": 1.0, "evid": 1.0}
-        self._knob_widgets = {}
+        self._peaks = {"sent": 1.0, "pps": 1.0}
 
     # -- lifecycle ----------------------------------------------------------
     def on_start(self):
@@ -55,14 +61,13 @@ class MainApp(MDApp):
             self._toast("Error: device is not rooted")
             return
         appdir = self.user_data_dir if _ON_DEVICE else "/tmp/deadnet"
-        self.ctl = AppController(appdir, managed_iface="wlan0",
+        self.ctl = AppController(appdir, managed_iface="wlan0", mon_iface="mon0",
                                  on_event=self._on_event)
-        self._build_knob_panel()
-        self._refresh_detect()
+        self.root.ids.mode_spinner.values = _MODE_LABELS
+        self._refresh_status()
         Clock.schedule_interval(self._tick, 0.5)
 
     def on_stop(self):
-        # hard guarantee: hand the radio back to Android on app exit
         if self.ctl is not None:
             try:
                 self.ctl.shutdown()
@@ -81,8 +86,10 @@ class MainApp(MDApp):
     # -- nav ----------------------------------------------------------------
     def goto(self, name: str):
         self.root.ids.sm.current = name
-        if name == "scan":
-            self.refresh_scents()
+        if name == "recon":
+            self._render_targets()
+        elif name == "select":
+            self._render_selection()
 
     # -- controller events (marshalled onto the UI thread) ------------------
     def _on_event(self, kind: str, data: dict):
@@ -91,280 +98,198 @@ class MainApp(MDApp):
     def _handle_event(self, kind: str, data: dict):
         if kind == "error":
             self._toast(data.get("msg", "error"))
-        elif kind == "mode":
-            self._refresh_detect()
-            self._toast(f"{data.get('preset','')} / {data.get('mode','')}")
-        elif kind == "detected":
-            self._render_airspaces(data.get("airspaces", []))
-            n = len(data.get("airspaces", []))
-            self.root.ids.detect_hint.text = (
-                f"associated to {n} airspace(s) — Smell to sweep"
-                if n else "not associated — join a Wi-Fi you own in Android settings")
-        elif kind == "smelling":
-            self._refresh_detect()
-            links = data.get("links", {})
-            self._toast(f"smelling: {links.get('mode','')}")
-            self.goto("scan")
-        elif kind == "scan":
-            self.root.ids.scan_status.text = (
-                f"P{data.get('phase')} smelling {data.get('done')}/{data.get('total')}")
-        elif kind == "scan_done":
-            self.root.ids.scan_status.text = "scan complete"
-            self.refresh_scents()
-        elif kind == "monitor_smelling":
-            self.goto("scan")
-            self.root.ids.scan_status.text = (
-                f"monitor smell: ch{data.get('channel')} "
-                f"{data.get('bssid','')} — radio OFFLINE {data.get('dwell')}s")
-        elif kind == "monitor_progress":
-            self.root.ids.scan_status.text = (
-                f"monitor smelling (offline) {data.get('elapsed')}/{data.get('total')}s")
-        elif kind == "monitor_done":
-            hint = data.get("reconnect")
-            self.root.ids.scan_status.text = (
-                f"deep smell done — {data.get('found', 0)} known"
-                + (f" · {hint}" if hint else ""))
-            if hint:
-                self._toast(hint)
-            self.refresh_scents()
-        elif kind in ("selected", "deselected", "selection_cleared"):
-            self._refresh_sel_count()
+        elif kind == "state":
+            self._apply_status(data)
+        elif kind == "recon":
+            self._toast(f"RECON — monitor ch{data.get('channel')}")
+            self._render_targets()
+        elif kind in ("target", "targets_cleared"):
+            if self.root.ids.sm.current == "recon":
+                self._render_targets()
+        elif kind == "selection":
+            self._render_selection()
+            self._toast(f"selected: {data.get('n', 0)}")
+        elif kind == "capgate":
+            ok = data.get("patched")
+            self._toast(("CapGate: PATCHED — " if ok else "CapGate: BLOCKED — ")
+                        + str(data.get("reason", "")))
+            self._refresh_status()
+        elif kind == "attack_start":
+            self.root.ids.attack_status.text = (
+                f"firing mode {data.get('mode')} @ {data.get('pps')} pps "
+                f"over {data.get('n')} target(s)")
+            self.goto("attack")
+        elif kind == "attack_done":
+            self.root.ids.attack_status.text = (
+                f"done: {data.get('ok', 0)}/{data.get('sent', 0)} accepted "
+                f"(avg {data.get('avg', 0)} pps)")
+        elif kind == "released":
+            self._toast("PHY released to Android")
+            self._refresh_status()
 
-    # -- §1 Detect (associated airspaces) -----------------------------------
-    def on_detect(self):
-        """Read which Wi-Fi airspace(s) the phone is already joined to. No seize."""
-        self._run(lambda: self.ctl.detect(), "reading associated airspaces…")
-
-    def on_adhd(self, on: bool):
+    # -- status strip -------------------------------------------------------
+    def _refresh_status(self):
         if self.ctl is not None:
-            self.ctl.adhd = bool(on)
+            self._apply_status(self.ctl.capabilities())
 
-    def on_connect(self):
-        """Stay associated; sweep the associated subnet into known_scents."""
-        if self.ctl is None:
+    def _apply_status(self, caps: dict):
+        if self.root is None:
             return
-        self._run(lambda: self.ctl.begin_smell(adhd=self.ctl.adhd),
-                  "smelling the airspace…")
+        st = (caps.get("state") or "android").upper()
+        patched = caps.get("patched")
+        gate = ("PATCHED" if patched else ("BLOCKED" if patched is False else "?"))
+        extra = ""
+        if caps.get("state") == AppState.RECON.value:
+            extra = f"  ·  targets {caps.get('targets', 0)} (AP {caps.get('aps', 0)})"
+        elif caps.get("state") == AppState.ATTACK.value:
+            extra = f"  ·  attacking {caps.get('selected', 0)} target(s)"
+        self.root.ids.status_bar.text = (
+            f"[b]{st}[/b]   cfg80211: {gate}   sel {caps.get('selected', 0)}{extra}")
+        self.root.ids.recon_count.text = (
+            f"targets: {caps.get('targets', 0)}  (AP {caps.get('aps', 0)} / "
+            f"sta {caps.get('stations', 0)})")
 
-    def on_deep_smell(self):
-        """2nd modality: monitor-mode sniff that sees through client isolation.
-        Drops the association for the sniff window (USB adb survives), then
-        reassociates. Runs on the _run worker thread (begin_monitor_smell blocks
-        for the dwell window and emits monitor_* progress)."""
-        if self.ctl is None:
-            return
-        self._run(lambda: self.ctl.begin_monitor_smell(),
-                  "deep smell: going offline to sniff…")
+    # -- §1 RECON -----------------------------------------------------------
+    def on_own(self):
+        self._run(lambda: self.ctl.own_recon(), "seizing PHY -> RECON…")
 
     def on_release(self):
-        self._run(lambda: self.ctl.release(), "releasing radio to Android…")
+        self._run(lambda: self.ctl.release(), "releasing PHY to Android…")
 
-    def _refresh_detect(self):
+    def on_capgate(self):
+        self._run(lambda: self.ctl.check_capability(), "probing cfg80211 (CapGate)…")
+
+    def on_clear_targets(self):
+        if self.ctl:
+            self.ctl.clear_targets()
+            self._render_targets()
+
+    def _render_targets(self):
         if self.ctl is None or self.root is None:
             return
-        cap = self.ctl.capabilities()
-        self.root.ids.radio_state.text = (
-            f"radio: [b]{cap['state']}[/b]   assoc: {cap.get('associated') or '-'}")
-        links = getattr(self.ctl, "links", {}) or {}
-        if links:
-            w0 = links.get("wlan0", {})
-            extra = " + wlan1" if links.get("wlan1") else ""
-            self.root.ids.link_state.text = (
-                f"[b]{links.get('mode','')}[/b]  {w0.get('ssid','')}{extra}")
-        else:
-            n = len(getattr(self.ctl, "airspaces_list", []) or [])
-            self.root.ids.link_state.text = f"airspaces: {n}" if n else ""
-
-    def _render_airspaces(self, airspaces):
-        """Show the airspace(s) we're associated to (read-only — the scope)."""
-        lst = self.root.ids.airspace_list
-        lst.clear_widgets()
-        if not airspaces:
-            lst.add_widget(self._info_label(
-                "no association — join a Wi-Fi you own, then Detect"))
-            return
-        for a in airspaces:
-            ssid = a.get("ssid") or "(unknown SSID)"
-            txt = (f"[b]{ssid}[/b]\n[size=19]{a.get('iface','')}   "
-                   f"{a.get('bssid','') or '—'}[/size]")
-            lab = Label(text=txt, markup=True, font_size=26, halign="left",
-                        valign="middle", size_hint_y=None, height=84)
-            lab.bind(size=lambda w, v: setattr(w, "text_size", (w.width - 24, None)))
-            lst.add_widget(lab)
-
-    # -- §2 Scan & Select ---------------------------------------------------
-    def refresh_scents(self):
-        if self.ctl is None:
-            return
-        threading.Thread(target=self._refresh_scents_worker, daemon=True).start()
-
-    def _refresh_scents_worker(self):
         try:
-            groups = self.ctl.scent_groups()
-            selected = {s["mac"] for s in self.ctl.selected()}
+            rows = self.ctl.targets()
         except Exception as exc:  # noqa: BLE001
-            Logger.error(f"{DEADNET_PREF}: scent read {exc}")
+            Logger.error(f"{DEADNET_PREF}: targets read {exc}")
             return
-        Clock.schedule_once(lambda dt: self._render_scents(groups, selected))
-
-    def _render_scents(self, groups, selected):
-        """Render the smelled electronics fuzzy-grouped by like-kind (vendor),
-        each family under a header — 'all the Apple phones lined up neatly'."""
-        lst = self.root.ids.scent_list
+        lst = self.root.ids.target_list
         lst.clear_widgets()
-        shown = 0
-        for vendor, members in groups:
-            if shown >= 200:
-                break
-            lst.add_widget(self._group_header(vendor, len(members)))
-            for s in members:
-                if shown >= 200:
-                    break
-                lst.add_widget(self._scent_row(s, s["mac"] in selected))
-                shown += 1
-        self._refresh_sel_count()
+        if not rows:
+            lst.add_widget(self._info_label("no targets yet — OWN PHY to start monitor recon"))
+            self._refresh_status()
+            return
+        for i, t in enumerate(rows[:250], start=1):
+            lst.add_widget(self._target_row(i, t))
+        self._refresh_status()
 
-    def _group_header(self, vendor, count):
-        lab = Label(text=f"[b]{vendor}[/b]  [size=16]({count})[/size]", markup=True,
-                    font_size=22, halign="left", valign="middle",
-                    size_hint_y=None, height=40, color=(0.55, 0.7, 1.0, 1))
+    def _target_row(self, idx, t):
+        kind = "AP" if t.get("kind") == "ap" else "sta"
+        label = t.get("ssid") or t.get("vendor") or "(unknown)"
+        txt = (f"[b]{idx}. {label}[/b]  [size=15]{t.get('mac','')}  "
+               f"ch{t.get('channel', 0)}  {t.get('rssi', 0)}dBm  {kind}[/size]")
+        lab = Label(text=txt, markup=True, font_size=19, halign="left",
+                    valign="middle", size_hint_y=None, height=52,
+                    color=((0.55, 0.7, 1.0, 1) if kind == "AP" else (0.85, 0.85, 0.85, 1)))
         lab.bind(size=lambda w, v: setattr(w, "text_size", (w.width, None)))
         return lab
 
-    def _scent_row(self, s, is_sel):
-        row = BoxLayout(size_hint_y=None, height=58, spacing=6)
-        kind = "AP" if not s["is_station"] else "sta"
-        label = s["ssid"] or s["vendor"] or "(unknown)"
-        txt = (f"[b]{label}[/b]  [size=15]{s['mac']}  {s['ip'] or ''}  "
-               f"ch{s['channel']}  {s['signal_dbm']}dBm  {kind}[/size]")
-        lab = Label(text=txt, markup=True, font_size=18, halign="left", valign="middle")
-        lab.bind(size=lambda w, v: setattr(w, "text_size", v))
-        btn = Button(text="[b]-[/b]" if is_sel else "[b]Select +[/b]", markup=True,
-                     size_hint_x=None, width=170, font_size=20,
-                     background_color=((0.4, 0.1, 0.1, 1) if is_sel else (0.1, 0.35, 0.1, 1)))
-        mac = s["mac"]
-        btn.bind(on_press=lambda *a: self._toggle_select(mac, is_sel))
-        row.add_widget(lab)
-        row.add_widget(btn)
-        return row
-
-    def _toggle_select(self, mac, is_sel):
-        if is_sel:
-            self.ctl.deselect(mac)
-        else:
-            self.ctl.select(mac)
-        self.refresh_scents()
+    # -- §2 SELECT ----------------------------------------------------------
+    def on_apply_selection(self, text):
+        if self.ctl is None:
+            return
+        self.ctl.set_selection(text or "")
+        self._render_selection()
 
     def on_clear_selection(self):
         if self.ctl:
             self.ctl.clear_selection()
-            self.refresh_scents()
+            self._render_selection()
 
-    def _refresh_sel_count(self):
+    def _render_selection(self):
+        if self.ctl is None or self.root is None:
+            return
+        try:
+            rows = self.ctl.selected()
+        except Exception:  # noqa: BLE001
+            rows = []
+        lst = self.root.ids.sel_list
+        lst.clear_widgets()
+        self.root.ids.sel_count.text = f"selected: {len(rows)}"
+        if not rows:
+            lst.add_widget(self._info_label(
+                "nothing selected — enter 3 / 1,3 / Shome* / all above"))
+            self._refresh_status()
+            return
+        for i, m in enumerate(rows, start=1):
+            kind = "AP" if m.get("typ") == "ap" else "sta"
+            label = m.get("label") or m.get("ssid") or m.get("mac")
+            txt = (f"[b]{i}. {label}[/b]  [size=15]{m.get('mac','')}  "
+                   f"{m.get('freq', 0)}MHz  {kind}[/size]")
+            lab = Label(text=txt, markup=True, font_size=19, halign="left",
+                        valign="middle", size_hint_y=None, height=50)
+            lab.bind(size=lambda w, v: setattr(w, "text_size", (w.width, None)))
+            lst.add_widget(lab)
+        self._refresh_status()
+
+    # -- §3 ATTACK ----------------------------------------------------------
+    def on_mode_pick(self, label):
+        if self.ctl is None:
+            return
+        mode = _MODE_BY_LABEL.get(label, 1)
+        self.ctl.set_mode(mode)
+
+    def on_pps(self, text):
         if self.ctl is None:
             return
         try:
-            n = len(self.ctl.selected())
-        except Exception:  # noqa: BLE001
-            n = 0
-        self.root.ids.sel_count.text = f"selected: {n}"
-
-    # -- §3 Configure & Trigger ---------------------------------------------
-    def on_focus_mode(self, focused: bool):
-        """Fork toggle: down = FOCUSED (picked electronics only), up = UNFOCUSED
-        (whole airspace). Bird hones leakers either way."""
-        if self.ctl is not None:
-            self.ctl.set_focused(bool(focused))
-        tgl = self.root.ids.tgl_focus
-        tgl.text = ("[b]FOCUSED (picked only)[/b]" if focused
-                    else "[b]UNFOCUSED (whole airspace)[/b]")
+            self.ctl.set_pps(int(float(text)))
+        except (TypeError, ValueError):
+            pass
 
     def on_fire(self):
         if self.ctl is None:
             return
-        if self.ctl.mode != Mode.LOCKED:
-            self._toast("FIRE needs an associated, smelling link (Smell first)")
+        self._run(lambda: self.ctl.start_attack(), "FIRE…")
+
+    def on_stop(self):
+        if self.ctl is None:
             return
-        self._run(lambda: self.ctl.fire(focused=self.ctl.focused), "firing…")
-
-    def on_cease(self):
-        self._run(lambda: self.ctl.cease(), "ceasing…")
-
-    def _build_knob_panel(self):
-        panel = self.root.ids.knob_panel
-        panel.clear_widgets()
-        for f in dataclasses.fields(self.ctl.knobs):
-            if f.name in _KNOB_SKIP:
-                continue
-            val = getattr(self.ctl.knobs, f.name)
-            row = BoxLayout(size_hint_y=None, height=52, spacing=8)
-            row.add_widget(Label(text=f.name, font_size=18, halign="left",
-                                 valign="middle", text_size=(None, None)))
-            if isinstance(val, bool):
-                b = Button(text="ON" if val else "OFF", size_hint_x=None, width=120,
-                           background_color=((0.1, 0.4, 0.1, 1) if val else (0.3, 0.3, 0.3, 1)))
-                b.bind(on_press=lambda btn, n=f.name: self._toggle_knob(n, btn))
-                row.add_widget(b)
-                self._knob_widgets[f.name] = b
-            else:
-                ti = TextInput(text=str(val), multiline=False, input_filter="float",
-                               size_hint_x=None, width=160, font_size=18)
-                ti.bind(on_text_validate=lambda w, n=f.name: self._set_knob(n, w.text),
-                        focus=lambda w, foc, n=f.name: (None if foc else self._set_knob(n, w.text)))
-                row.add_widget(ti)
-                self._knob_widgets[f.name] = ti
-            panel.add_widget(row)
-
-    def _toggle_knob(self, name, btn):
-        new = not getattr(self.ctl.knobs, name)
-        setattr(self.ctl.knobs, name, new)
-        btn.text = "ON" if new else "OFF"
-        btn.background_color = (0.1, 0.4, 0.1, 1) if new else (0.3, 0.3, 0.3, 1)
-
-    def _set_knob(self, name, text):
-        cur = getattr(self.ctl.knobs, name)
-        try:
-            val = type(cur)(float(text)) if isinstance(cur, (int, float)) else text
-            if isinstance(cur, int):
-                val = int(float(text))
-            setattr(self.ctl.knobs, name, val)
-        except Exception:  # noqa: BLE001
-            self._toast(f"bad value for {name}")
+        self._run(lambda: self.ctl.stop_attack(), "stopping…")
 
     # -- periodic tick ------------------------------------------------------
     def _tick(self, dt):
         if self.ctl is None or self.root is None:
             return
-        if self.ctl.mode == Mode.FIRING:
+        caps = self.ctl.capabilities()
+        if caps.get("attacking"):
             self._update_gauges(self.ctl.state_metrics())
-        # stream newly-smelled electronics into the Smell list while sweeping
-        if self.ctl.mode == Mode.LOCKED and self.root.ids.sm.current == "scan":
-            self.refresh_scents()
+        # live-grow the recon list while monitoring
+        if caps.get("state") == AppState.RECON.value and self.root.ids.sm.current == "recon":
+            self._render_targets()
 
     def _update_gauges(self, m):
-        tx = self.root.ids.cell_tx
-        tx.gauge_value = m["tx_ps"]
-        tx.gauge_max = self._auto("tx", m["tx_ps"], 50.0)
-        tx.big_text = str(int(round(m["tx_ps"])))
+        sent = self.root.ids.cell_sent
+        sent.gauge_value = m["sent"]
+        sent.gauge_max = self._auto("sent", m["sent"], 50.0)
+        sent.big_text = str(int(m["sent"]))
 
-        surv = self.root.ids.cell_surv
-        surv.gauge_value = m["leaking"]
-        surv.gauge_max = self._auto("surv", m["leaking"], 5.0)
-        if m["confirmed"]:
-            surv.arc_rgba = [0.07, 0.69, 0.07, 1]
-            surv.big_rgba = [0.07, 0.69, 0.07, 1]
-            surv.big_text = "0"
-            surv.caption_text = "[b]CONFIRMED[/b]"
+        acc = self.root.ids.cell_acc
+        acc.gauge_value = m["accepted"]
+        acc.gauge_max = max(1, m["sent"])
+        acc.big_text = str(int(m["accepted"]))
+        if m["sent"] and m["accepted"] >= m["sent"]:
+            acc.arc_rgba = [0.07, 0.69, 0.07, 1]
+            acc.big_rgba = [0.07, 0.69, 0.07, 1]
+            acc.caption_text = "all accepted"
         else:
-            surv.arc_rgba = [0.82, 0.11, 0.11, 1]
-            surv.big_rgba = [0.82, 0.11, 0.11, 1]
-            surv.big_text = str(int(m["leaking"]))
-            surv.caption_text = "leaking"
+            acc.arc_rgba = [0.82, 0.55, 0.11, 1]
+            acc.big_rgba = [0.82, 0.55, 0.11, 1]
+            acc.caption_text = f"{m['miss']} rejected"
 
-        evid = self.root.ids.cell_evid
-        evid.gauge_value = m["evidence"]
-        evid.gauge_max = self._auto("evid", m["evidence"], 50.0)
-        evid.big_text = str(int(m["evidence"]))
+        pps = self.root.ids.cell_pps
+        pps.gauge_value = m["pps"]
+        pps.gauge_max = self._auto("pps", m["pps"], 100.0)
+        pps.big_text = str(int(m["pps"]))
 
     def _auto(self, key, value, floor):
         peak = max(value, self._peaks[key] * 0.9, floor)
@@ -387,9 +312,9 @@ class MainApp(MDApp):
 
     @staticmethod
     def _info_label(text):
-        lab = Label(text=text, font_size=18, halign="left", valign="middle",
-                    size_hint_y=None, height=28)
-        lab.bind(size=lambda w, v: setattr(w, "text_size", v))
+        lab = Label(text=text, font_size=19, halign="left", valign="middle",
+                    size_hint_y=None, height=30, color=(0.7, 0.7, 0.7, 1))
+        lab.bind(size=lambda w, v: setattr(w, "text_size", (w.width, None)))
         return lab
 
     @staticmethod

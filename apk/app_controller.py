@@ -1,49 +1,36 @@
 """
-AppController — the brain behind the associate-first DeadNet redesign. Bridges the
-Kivy screens to the engine layer (arbiter / radio / finders / emission /
-birdobserver).
+AppController (v3 M4) — the ANDROID<->APP{RECON,ATTACK} state machine.
 
-New operating model (owner-revised: "there's nothing to monitor when you're not
-focusing", so the monitor-mode router-discovery phase is GONE):
+This is the brain of the own-the-PHY redesign. It bridges the Kivy screens to the
+v3 engine layer and encodes the operator workflow from V3_PLAN §3:
 
-  DETECT   -> enumerate the Wi-Fi airspace(s) the phone is ALREADY associated to
-              (wlan0, and wlan1 if the framework raised a 2nd STA). No radio seize,
-              no monitor. Selection is IMPLICIT: whatever the owner joined in
-              Android settings *is* the scope. You can only smell air you hold a
-              key to — that is the safety model.
+    launch ─► OWN PHY ──► APP/RECON   (monitor; Android guarded)
+                            │  live target list (recon.TargetStore)
+                            ▼
+                          SELECT      (operator picks targets / S<pattern>)
+                            ▼
+                          APP/ATTACK  (managed vif up, unassociated; mgmt-TX)
+                            │  live: accepted/N, actual pps
+                            ▼
+                          RELEASE ─► ANDROID (baseline restored, guard off)
 
-  SMELL    -> stay associated; a wired Finder sweeps the associated subnet(s) into
-              known_scents (append-only master store), fuzzy-grouped by
-              like-electronics (vendor/OUI). This is the full-space smell, scoped to
-              the airspace(s) of interest.
+Ownership + mode are owned by `engine.phyguard.PhyGuard`; target discovery by
+`engine.recon.ReconScanner` (monitor); the attack by
+`engine.attack.AttackController` driving `engine.mgmt_tx` through the patched
+cfg80211 (gated by `engine.capgate.CapGate`). Only one PhyMode is ever live —
+the single RF chain forbids monitor + managed together — so RECON capture is
+torn down before an ATTACK burst and restored after.
 
-  FIRE     -> one of two forks, both with the BirdObserver airborne:
-                * UNFOCUSED : attention spread evenly across every electronic smelled
-                              on the airspace. If one keeps mailing envelopes despite
-                              the owner's transmissions, the bird hones attention onto
-                              that non-compliant electronic.
-                * FOCUSED   : identical, but the scope is limited up front to the
-                              electronics the owner picked.
-              Internally the native emitter always runs per-host (EmitMode.FOCUSED)
-              so the bird can hone in BOTH forks; the fork only decides which hosts
-              seed the attention set.
-
-Release-back / "leave it how it was found": begin_smell() snapshots the clean Wi-Fi
-baseline before touching any OEM knob; release() restores it. Because we never seize
-the radio into monitor, release does NOT toggle Wi-Fi off/on (that would drop adb),
-it only restores the dual-STA / multi-internet knobs to how they were found.
-
-Headless-safe: the Kivy Logger import is guarded and every device call is funnelled
-through the engine modules, so this file imports and its state machine self-tests
-off-device. Stdlib + engine only.
+Headless-safe: the Kivy Logger import is guarded and every privileged call is
+funnelled through the engine modules, so this file imports and its state-machine
+self-test runs off-device (all engine collaborators are injectable). Stdlib +
+engine only.
 """
 from __future__ import annotations
 
 import enum
-import re
 import threading
-import time
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional
 
 try:
     from kivy.logger import Logger
@@ -54,495 +41,456 @@ except Exception:  # off-device
         def warning(self, *a, **k): pass
     Logger = _L()
 
-from engine.contracts import (
-    DB_KNOWN_SCENTS, DB_ATTENTION, DB_STATE,
-    Knobs, EmitMode, ScanPhase, CardState,
-    NetInfo, AttentionEntry, now_ms,
+from engine.contracts import Ownership, PhyMode
+from engine.recon import TargetStore, ReconScanner, DEFAULT_CHANNELS
+from engine.attack import (
+    AttackController, AttackPlan, ATTACK_MODES, from_recon, select_spoof,
+    build_spoof_set,
 )
-from engine.arbiter import RowReaderArbiter
-from engine.radio import RadioController
-from engine.toolbroker import ToolBroker
+from engine.mgmt_tx import MgmtTxController, MgmtCtx, MgmtTarget, DEFAULT_FREQ
 
 DEADNET_PREF = "DeadNet"
 
-
-class Preset(enum.Enum):
-    NONE = "none"
-    LOCK = "lock"            # associated + smelling (ready to fire)
+# Attack-mode ids that need no recon selection (wildcard / self-targeting).
+NUKE_MODE = 0
 
 
-class Mode(enum.Enum):
-    IDLE = "idle"            # radio with Android, nothing running
-    LOCKED = "locked"        # associated + wired Finder smelling, ready to fire
-    FIRING = "firing"        # emitter airborne
+class AppState(enum.Enum):
+    """Flattened view of PhyGuard ownership+mode for the UI."""
+    ANDROID = "android"   # Ownership.ANDROID — radio with the framework
+    RECON = "recon"       # Ownership.APP + PhyMode.RECON — monitor detect
+    ATTACK = "attack"     # Ownership.APP + PhyMode.ATTACK — mgmt-TX injection
 
 
 class AppController:
     def __init__(self, appdir: str, managed_iface: str = "wlan0",
-                 on_event: Optional[Callable[[str, dict], None]] = None):
+                 mon_iface: str = "mon0",
+                 on_event: Optional[Callable[[str, dict], None]] = None,
+                 phyguard=None, tx=None, capgate=None, attack=None,
+                 recon_factory=None):
         self.appdir = appdir
         self.managed_iface = managed_iface
+        self.mon_iface = mon_iface
         self._emit = on_event or (lambda kind, data: None)
 
-        self.knobs = Knobs()
-        self.preset = Preset.NONE
-        self.mode = Mode.IDLE
-        self.net: Optional[NetInfo] = None
+        # --- engine collaborators (all injectable for the off-device test) ---
+        if phyguard is None:
+            from engine.phyguard import PhyGuard
+            phyguard = PhyGuard(managed_iface, mon_iface)
+        self.phyguard = phyguard
+        self.store = TargetStore()
+        self.tx = tx if tx is not None else MgmtTxController(appdir)
+        if capgate is None:
+            from engine.capgate import CapGate
+            capgate = CapGate(iface=managed_iface, tx_send=self.tx.send)
+        self.capgate = capgate
+        self.attack = attack if attack is not None else AttackController(
+            self.tx.send, ensure_attack=self._ensure_attack_mode)
+        # recon_factory(mon_iface, store, on_target, set_channel) -> ReconScanner
+        self._recon_factory = recon_factory or self._default_recon_factory
+        self.recon: Optional[ReconScanner] = None
 
-        # Detect/Smell flow state.
-        self.airspaces_list: List[dict] = []   # associated airspaces last enumerated
-        self.adhd: bool = False                # True => request a 2nd STA ("double guns")
-        self.monitor_dwell_s: float = 20.0     # deep (monitor) smell sniff window
-        self.focused: bool = False             # FIRE fork: True=picked-only, False=whole
-        self.links: dict = {}                  # post-associate link summary
+        # --- operator state ---
+        self.recon_channel: int = 6
+        self.selection_spec: str = ""
+        self.spoof: List[MgmtTarget] = []          # resolved spoof set (the picks)
+        self.attack_mode: int = 1                  # catalogue id (0 = NUKE)
+        self.pps: int = 100
+        self.budget: int = 0                       # 0 = until stopped
+        self.patched: Optional[bool] = None        # last CapGate decision
+        self.cap_reason: str = ""
 
-        self.arbiter = RowReaderArbiter(appdir)
-        self.radio = RadioController(managed_iface)
-        self.toolbroker = ToolBroker(appdir)
-
-        # lazily-built engine services (device-touching)
-        self._finder = None
-        self._netfetcher = None
-        self._emission = None
-        self._rsm = None
-        self._bird = None
-        self._survival = None            # SurvivalMonitor (feeds the live gauges)
-        self._survival_sample = None     # latest SurvivalSample
-        self._passive = None             # PassiveFinder (ARP-listen discovery during fire)
-
+        self._attack_stop: Optional[threading.Event] = None
+        self._attack_thread: Optional[threading.Thread] = None
+        self._tick: Dict[str, int] = {"sent": 0, "ok": 0, "pps": 0}
         self._lock = threading.RLock()
 
-    # -- event helper -------------------------------------------------------
+    # -- recon scanner builder --------------------------------------------
+    def _default_recon_factory(self, mon_iface, store, on_target, set_channel):
+        return ReconScanner(mon_iface=mon_iface, store=store, on_target=on_target,
+                            set_channel=set_channel, channels=list(DEFAULT_CHANNELS))
+
+    # -- event helper ------------------------------------------------------
     def emit(self, kind: str, **data) -> None:
         try:
             self._emit(kind, data)
         except Exception as exc:  # noqa: BLE001
             Logger.error(f"{DEADNET_PREF}: on_event({kind}) raised {exc}")
 
-    # -- capability snapshot (for the Detect screen) ------------------------
+    # -- state view --------------------------------------------------------
+    @property
+    def state(self) -> AppState:
+        if self.phyguard.ownership != Ownership.APP:
+            return AppState.ANDROID
+        return AppState.ATTACK if self.phyguard.mode == PhyMode.ATTACK else AppState.RECON
+
+    def is_attacking(self) -> bool:
+        t = self._attack_thread
+        return t is not None and t.is_alive()
+
     def capabilities(self) -> dict:
-        caps = self.toolbroker.capabilities()
         return {
-            "state": self.radio.state.value,
-            "associated": self.radio.is_associated(),
-            "tools": {k: bool(v) for k, v in caps.items()},
-            "magisk": self.toolbroker.magisk_module_installed(),
+            "state": self.state.value,
+            "ownership": self.phyguard.ownership.value,
+            "mode": self.phyguard.mode.value if self.phyguard.mode else "",
+            "patched": self.patched,
+            "cap_reason": self.cap_reason,
+            "targets": self.store.count(),
+            "aps": self.store.count("ap"),
+            "stations": self.store.count("station"),
+            "selected": len(self.spoof),
+            "attacking": self.is_attacking(),
         }
 
-    # =======================================================================
-    # DETECT  (enumerate the airspaces we are ALREADY associated to — no seize)
-    # =======================================================================
-    def detect(self) -> bool:
-        """Owner hits 'Detect': read which Wi-Fi airspace(s) the phone is joined
-        to right now. No radio seize, no monitor — selection is implicit in what
-        the owner associated with in Android settings."""
-        self.airspaces_list = self.airspaces()
-        self.emit("detected", airspaces=self.airspaces_list)
-        return True
+    def _emit_state(self) -> None:
+        self.emit("state", **self.capabilities())
 
-    def airspaces(self) -> List[dict]:
-        """The airspace(s) we are associated to: wlan0 always, wlan1 if the OEM
-        dual-STA raised a 2nd link. Each is {iface, ssid, bssid}."""
-        out: List[dict] = []
-        ssid = self.radio.current_ssid()
-        bssid = self.radio.is_associated() or ""
-        if ssid or bssid:
-            out.append({"iface": self.managed_iface, "ssid": ssid, "bssid": bssid})
-        sec = self.radio.secondary_iface()
-        if sec:
-            out.append({"iface": sec, "ssid": "",
-                        "bssid": (self.radio.link_bssid(sec) or "")})
-        return out
-
-    # =======================================================================
-    # SMELL  (associate-ensure -> wired subnet sweep scoped to the airspace)
-    # =======================================================================
-    def begin_smell(self, adhd: Optional[bool] = None) -> bool:
-        """Begin smelling the associated airspace. We stay associated (no monitor):
-        snapshot the clean baseline, best-effort permit a 2nd STA if ADHD, confirm
-        the managed link, discover the subnet, and start the wired Finder sweeping
-        it into known_scents. Empirically a monitor cannot run beside the associated
-        link, so smelling is subnet/ARP-based on the live association."""
+    # =====================================================================
+    # OWN / RECON  (ANDROID -> APP/RECON: seize monitor + start discovery)
+    # =====================================================================
+    def own_recon(self, channel: Optional[int] = None) -> bool:
+        """Seize the PHY into RECON and start monitor-mode target discovery.
+        From ATTACK this just switches back to RECON. Android is guarded out."""
         with self._lock:
-            self.adhd = self.adhd if adhd is None else bool(adhd)
-            want_second = self.adhd
-            # snapshot "how it was found" before we touch any OEM knob
-            try:
-                self.radio.capture_baseline()
-            except Exception:  # noqa: BLE001
-                pass
-            if want_second:
-                try:
-                    self.radio.set_dual_sta(True)
-                except Exception:  # noqa: BLE001
-                    pass
-            if not self.radio.ensure_managed():
-                self.emit("error", msg="not associated — join a Wi-Fi you own first")
+            ch = self.recon_channel if channel is None else int(channel)
+            self.recon_channel = ch
+            if not self.phyguard.own(ch):
+                self.emit("error", msg="could not seize PHY for RECON")
+                self._emit_state()
                 return False
-            from engine.iface import discover_iface_net
-            try:
-                self.net = discover_iface_net(self.managed_iface)
-            except Exception as exc:  # noqa: BLE001
-                self.emit("error", msg=f"net discovery failed: {exc}")
-                return False
-            self._start_wired_finder()
-            self.links = self._link_summary(want_second)
-            self.preset = Preset.LOCK
-            self.mode = Mode.LOCKED
-            self.emit("smelling", links=self.links, net=self._net_summary())
-            self.emit("mode", mode=self.mode.value, preset=self.preset.value,
-                      net=self._net_summary())
+            self._start_recon()
+            self.emit("recon", channel=ch)
+            self._emit_state()
             return True
 
-    # back-compat alias (older callers / tests)
-    def connect(self, adhd: Optional[bool] = None) -> bool:
-        return self.begin_smell(adhd=adhd)
-
-    # =======================================================================
-    # DEEP SMELL  (monitor-mode sniff interlude — sees through client isolation)
-    # =======================================================================
-    def _assoc_channel(self) -> Optional[int]:
-        """The channel wlan0 is currently associated on, parsed from `iw dev`.
-        Needed to tune the monitor to the joined airspace (we lock, never hop)."""
+    def _start_recon(self) -> None:
+        if self.recon is not None:
+            return
+        self.recon = self._recon_factory(
+            self.mon_iface, self.store, self._on_target,
+            getattr(self.phyguard.radio, "set_channel", None))
         try:
-            from engine import rootshell
-            out = rootshell.su(f"iw dev {self.managed_iface} info") or ""
-        except Exception:  # noqa: BLE001
-            return None
-        m = re.search(r"channel\s+(\d+)", out)
-        return int(m.group(1)) if m else None
+            self.recon.start()
+        except Exception as exc:  # noqa: BLE001
+            Logger.error(f"{DEADNET_PREF}: recon start failed: {exc}")
 
-    def begin_monitor_smell(self, dwell_s: Optional[float] = None) -> bool:
-        """Legacy monitor-mode "deep smell" — seized a monitor vif and ran the
-        now-deleted engine.finder_air.FinderAir over it. Removed in the v3 M0
-        teardown; monitor discovery is replaced by engine/recon.py (ReconScanner)
-        running under PhyGuard RECON ownership."""
-        # TODO(M4): rebuild as RECON mode — PhyGuard.own()/to_recon() + ReconScanner
-        # populating the target store (see V3_PLAN §6, §15 wiring seams).
-        raise NotImplementedError(
-            "monitor deep-smell removed in v3 M0; rebuilt on engine/recon.py in M4")
-
-    def _link_summary(self, wanted_second: bool) -> dict:
-        """Describe the associated link(s) and which mode we actually got."""
-        ssid = self.radio.current_ssid()
-        bssid = self.radio.is_associated() or ""
-        second = self.radio.secondary_iface()
-        if second is not None:
-            mode = "double_guns" if wanted_second else "two_links"
-        else:
-            mode = "single"
-        return {
-            "wlan0": {"ssid": ssid, "bssid": bssid},
-            "wlan1": ({"iface": second} if second else None),
-            "mode": mode,
-            "wanted_second": wanted_second,
-        }
-
-    def _start_wired_finder(self) -> None:
-        # TODO(M4): the legacy engine.finder subnet sweep + NetFetcher mac-vacuum
-        # were removed in the v3 M0 teardown. v3 discovery is monitor-based
-        # (engine/recon.py ReconScanner), not an associated L3 sweep. No-op so the
-        # begin_smell() skeleton still runs; rewire to RECON in M4.
-        return
-
-    def _run_scan(self) -> None:
-        # TODO(M4): legacy finder scan worker (engine.finder, removed in M0).
-        return
-
-    def _stop_wired_finder(self) -> None:
-        if self._netfetcher is not None:
+    def _stop_recon(self) -> None:
+        r, self.recon = self.recon, None
+        if r is not None:
             try:
-                self._netfetcher.stop()
-            except Exception:  # noqa: BLE001
-                pass
-            self._netfetcher = None
-        self._finder = None
+                r.stop()
+            except Exception as exc:  # noqa: BLE001
+                Logger.error(f"{DEADNET_PREF}: recon stop failed: {exc}")
 
-    # =======================================================================
-    # SMELL VIEW  (known_scents, fuzzy-grouped by like-electronics)
-    # =======================================================================
-    def scents(self) -> List[dict]:
-        rows = self.arbiter.read(
-            DB_KNOWN_SCENTS,
-            "SELECT mac, ip, vendor, ssid, ap_bssid, channel, signal_dbm, "
-            "is_station, net_id, last_seen_ms FROM scents ORDER BY last_seen_ms DESC")
-        cols = ("mac", "ip", "vendor", "ssid", "ap_bssid", "channel",
-                "signal_dbm", "is_station", "net_id", "last_seen_ms")
-        return [dict(zip(cols, r)) for r in rows]
+    def _on_target(self, t) -> None:
+        # throttled at the UI layer; just surface that the inventory grew/changed
+        self.emit("target", mac=t.mac, kind=t.kind, ssid=t.ssid,
+                  channel=t.channel, rssi=t.rssi)
 
-    def scent_groups(self) -> List[Tuple[str, List[dict]]]:
-        """Fuzzy associator: the smelled electronics lined up by like-kind — all
-        the Apple phones in one row, etc. Groups by OUI vendor (blank => 'unknown'),
-        biggest family first. Append-only master store: nothing is pruned, only
-        regrouped, so a device keeps its place across re-smells."""
-        groups: dict = {}
-        for s in self.scents():
-            key = (s.get("vendor") or "").strip() or "unknown"
-            groups.setdefault(key, []).append(s)
-        return sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0].lower()))
+    def targets(self, kind: Optional[str] = None) -> List[dict]:
+        """Current recon inventory as dicts (APs + stations), RSSI-sorted."""
+        return [t.as_dict() for t in self.store.snapshot(kind)]
 
-    def selected(self) -> List[dict]:
-        rows = self.arbiter.read(
-            DB_ATTENTION, "SELECT mac, ip, net_id, weight, pinned FROM attention")
-        return [dict(zip(("mac", "ip", "net_id", "weight", "pinned"), r)) for r in rows]
+    def clear_targets(self) -> None:
+        self.store.clear()
+        self.emit("targets_cleared")
 
-    def select(self, mac: str, weight: float = 1.0, pinned: bool = True) -> None:
-        """'Select +' — pin a scent into the attention list for a FOCUSED fire."""
-        row = self.arbiter.read(
-            DB_KNOWN_SCENTS, "SELECT ip, net_id FROM scents WHERE mac=?", (mac,))
-        ip, net_id = (row[0] if row else ("", ""))
-        self.arbiter.write(
-            DB_ATTENTION,
-            "INSERT OR REPLACE INTO attention(mac, ip, net_id, weight, pinned) "
-            "VALUES(?,?,?,?,?)", (mac, ip, net_id, float(weight), 1 if pinned else 0))
-        self.emit("selected", mac=mac)
-
-    def deselect(self, mac: str) -> None:
-        self.arbiter.write(DB_ATTENTION, "DELETE FROM attention WHERE mac=?", (mac,))
-        self.emit("deselected", mac=mac)
+    # =====================================================================
+    # SELECT  (resolve a selection spec against the recon inventory)
+    # =====================================================================
+    def set_selection(self, spec: str) -> int:
+        """Resolve a selection spec ('3' | '1,3' | 'S<glob>' | 'S~<ere>' | 'all')
+        against the recon inventory into the spoof set. Returns the count."""
+        self.selection_spec = (spec or "").strip()
+        mts = [from_recon(t) for t in self.store.snapshot()]
+        self.spoof = select_spoof(mts, self.selection_spec, default_freq=DEFAULT_FREQ)
+        self.emit("selection", spec=self.selection_spec, n=len(self.spoof),
+                  targets=[self._mt_dict(m) for m in self.spoof])
+        return len(self.spoof)
 
     def clear_selection(self) -> None:
-        self.arbiter.write(DB_ATTENTION, "DELETE FROM attention")
-        self.emit("selection_cleared")
+        self.selection_spec = ""
+        self.spoof = []
+        self.emit("selection", spec="", n=0, targets=[])
 
-    # =======================================================================
-    # CONFIGURE & TRIGGER  (fire the emitter; focused or unfocused fork)
-    # =======================================================================
-    def set_focused(self, focused: bool) -> None:
-        self.focused = bool(focused)
-        self.emit("fork", focused=self.focused)
+    @staticmethod
+    def _mt_dict(m: MgmtTarget) -> dict:
+        return {"mac": m.mac, "typ": m.typ, "freq": m.freq,
+                "label": m.label, "ssid": m.ssid}
 
-    def fire(self, focused: Optional[bool] = None, on_stats=None) -> bool:
-        """Legacy ARP FIRE — launched the native emitter (engine.emission) with the
-        BirdObserver (engine.birdobserver), the SurvivalMonitor live gauges and the
-        passive ARP finder. The whole ARP-poison transport was removed in the v3 M0
-        teardown; v3 attacks with scheduled 802.11 mgmt-TX instead."""
-        # TODO(M4): rebuild as ATTACK mode — select_spoof() over the recon target
-        # store -> AttackController(mgmt_tx.send, ensure_attack=phyguard.to_attack)
-        # with CapGate gating the patched cfg80211 (see V3_PLAN §6, §15).
-        raise NotImplementedError(
-            "ARP FIRE removed in v3 M0; rebuilt on engine/attack.py mgmt-TX in M4")
+    def selected(self) -> List[dict]:
+        return [self._mt_dict(m) for m in self.spoof]
+
+    def set_mode(self, mode: int) -> None:
+        self.attack_mode = int(mode)
+        self.emit("attack_mode", mode=self.attack_mode,
+                  label=ATTACK_MODES.get(self.attack_mode, "NUKE" if self.attack_mode == NUKE_MODE else "?"))
+
+    def set_pps(self, pps: int) -> None:
+        self.pps = max(1, int(pps))
+
+    # =====================================================================
+    # CAPABILITY GATE  (patched cfg80211 required for ATTACK)
+    # =====================================================================
+    def check_capability(self) -> bool:
+        """Run CapGate (stages the injector, sends an inert spoofed-SA probe).
+        Caches the decision; ATTACK refuses unless patched. Needs the PHY in a
+        TX-capable state (owned, or associated) for the probe to be meaningful."""
+        try:
+            self.tx.stage()
+        except Exception as exc:  # noqa: BLE001
+            Logger.error(f"{DEADNET_PREF}: injector stage failed: {exc}")
+        try:
+            res = self.capgate.check()
+        except Exception as exc:  # noqa: BLE001
+            Logger.error(f"{DEADNET_PREF}: capgate failed: {exc}")
+            self.patched, self.cap_reason = False, f"capgate error: {exc}"
+            self.emit("capgate", patched=False, reason=self.cap_reason)
+            return False
+        self.patched = bool(res.patched)
+        self.cap_reason = res.reason
+        self.emit("capgate", patched=self.patched, reason=self.cap_reason,
+                  decided_by=res.decided_by)
+        return self.patched
+
+    # =====================================================================
+    # ATTACK  (APP/RECON -> APP/ATTACK: scheduled mgmt-TX at the selection)
+    # =====================================================================
+    def _ensure_attack_mode(self) -> bool:
+        """Stop RECON capture (frees the RF chain) then switch the PHY to ATTACK."""
+        self._stop_recon()
+        return self.phyguard.to_attack()
+
+    def _spoof_for_run(self) -> List[MgmtTarget]:
+        if self.attack_mode == NUKE_MODE:
+            # NUKE: wildcard over every detected AP (fall back to the picks).
+            mts = [from_recon(t) for t in self.store.snapshot("ap")]
+            nuke = build_spoof_set(mts, "all", own_freq=self.recon_freq())
+            return nuke or self.spoof
+        return list(self.spoof)
+
+    def recon_freq(self) -> int:
+        from engine.recon import channel_to_freq
+        f = channel_to_freq(self.recon_channel)
+        return f or DEFAULT_FREQ
+
+    def start_attack(self, budget: Optional[int] = None) -> bool:
+        """Begin the mgmt-TX burst over the current selection. Gated by CapGate:
+        refuses on a stock (unpatched) cfg80211. Runs on a worker thread; live
+        progress arrives via the 'attack_tick' event."""
+        with self._lock:
+            if self.is_attacking():
+                self.emit("error", msg="already attacking")
+                return False
+            if self.phyguard.ownership != Ownership.APP:
+                self.emit("error", msg="own the PHY (RECON) before attacking")
+                return False
+            if self.patched is None:
+                self.check_capability()
+            if not self.patched:
+                self.emit("error", msg=f"ATTACK blocked — {self.cap_reason or 'stock cfg80211'}")
+                return False
+            spoof = self._spoof_for_run()
+            if not spoof:
+                self.emit("error", msg="no targets selected (pick from RECON, or use NUKE)")
+                return False
+            plan = AttackPlan(
+                mode=self.attack_mode, spoof=spoof, iface=self.managed_iface,
+                pps=self.pps, budget=(self.budget if budget is None else int(budget)),
+                title=ATTACK_MODES.get(self.attack_mode, "nuke"),
+                nuke=(self.attack_mode == NUKE_MODE))
+            ctx = MgmtCtx()
+            self._attack_stop = threading.Event()
+            self._tick = {"sent": 0, "ok": 0, "pps": plan.pps}
+            self._attack_thread = threading.Thread(
+                target=self._attack_worker, args=(plan, ctx), name="attack", daemon=True)
+            self._attack_thread.start()
+            self._emit_state()
+            self.emit("attack_start", mode=self.attack_mode, n=len(spoof), pps=self.pps)
+            return True
+
+    def _attack_worker(self, plan: AttackPlan, ctx: MgmtCtx) -> None:
+        def on_tick(d: dict):
+            self._tick = d
+            self.emit("attack_tick", **d)
+        try:
+            summary = self.attack.run(plan, ctx, on_tick=on_tick, stop=self._attack_stop)
+        except Exception as exc:  # noqa: BLE001
+            Logger.error(f"{DEADNET_PREF}: attack run failed: {exc}")
+            summary = {"sent": self._tick.get("sent", 0), "ok": self._tick.get("ok", 0)}
+        # fold the authoritative final counts in (on_tick only fires every ~pps
+        # frames, so a short bounded burst may never have ticked)
+        self._tick = {"sent": int(summary.get("sent", 0)),
+                      "ok": int(summary.get("ok", 0)),
+                      "pps": int(summary.get("target_pps", plan.pps))}
+        self.emit("attack_done", **summary)
+        self._emit_state()
+
+    def stop_attack(self, back_to_recon: bool = True) -> None:
+        """Halt the burst. By default returns the PHY to RECON (re-adds mon0 and
+        restarts discovery) so the operator can reselect."""
+        with self._lock:
+            if self._attack_stop is not None:
+                self._attack_stop.set()
+            t = self._attack_thread
+        if t is not None and t.is_alive():
+            t.join(timeout=3.0)
+        with self._lock:
+            self._attack_thread = None
+            self._attack_stop = None
+            if back_to_recon and self.phyguard.ownership == Ownership.APP:
+                if self.phyguard.to_recon():
+                    self._start_recon()
+            self._emit_state()
 
     def state_metrics(self) -> dict:
-        """Metrics for the gauges (polled on a Clock tick). Preferred source is the
-        live SurvivalMonitor sample (our ARP TX / surviving-leaks / evidence off the
-        associated link); falls back to the DB_STATE rollup (emit.cpp native
-        per-target stats) when no survival sample is in yet."""
-        s = self._survival_sample
-        if s is not None:
-            return {"tx_ps": s.arp_tx_ps, "leaking": s.surv_ps,
-                    "evidence": s.evidence_ps,
-                    "confirmed": bool(s.confirmed) and self.mode == Mode.FIRING,
-                    "targets": len(self.selected())}
-        rows = self.arbiter.read(
-            DB_STATE, "SELECT tx_pps, escaped_pkts, compliant FROM metrics")
-        tx = sum((r[0] or 0.0) for r in rows)
-        leaking = sum(1 for r in rows if not r[2])
-        evidence = sum((r[1] or 0) for r in rows)
-        confirmed = bool(rows) and leaking == 0 and self.mode == Mode.FIRING
-        return {"tx_ps": tx, "leaking": leaking, "evidence": evidence,
-                "confirmed": confirmed, "targets": len(rows)}
+        """Live attack gauges (polled on a Clock tick)."""
+        t = self._tick or {}
+        sent = int(t.get("sent", 0))
+        ok = int(t.get("ok", 0))
+        return {"sent": sent, "accepted": ok,
+                "miss": max(0, sent - ok),
+                "pps": int(t.get("pps", self.pps)),
+                "targets": len(self.spoof),
+                "attacking": self.is_attacking()}
 
-    def _attention_net_id(self) -> str:
-        """The canonical net_id used for attention rows AND the transmitter's
-        pump filter. It MUST match the convention the master store (scents) is
-        keyed by — the Finder writes `scents.net_id = self.net.iface`, select()
-        and the BirdObserver copy that through, and NetFetcher gates on
-        `self.net.iface in focus`. So the whole pipeline keys on the iface, NOT
-        subnet_cidr. Mixing the two silently drops rows from the emit focus set
-        (the pump filters attention `WHERE net_id = tx.net_id`), which is why a
-        focused fire used to leave the gauges flat — the picks carried the
-        iface-style net_id while the transmitter filtered on subnet_cidr."""
-        if self.net is None:
-            return self.managed_iface
-        return self.net.iface or self.managed_iface
-
-    def _seed_targets(self, focused: bool) -> int:
-        """Fill the attention/focus set so emit.cpp has something to aim at, and
-        return the number of victim targets (excludes the gateway).
-
-          * focused   : keep only the owner's picks (already pinned in attention via
-                        select()); just make sure the gateway is present.
-          * unfocused : add every smelled host on the connected subnet, evenly.
-        The gateway is pinned + marked so emit can recover its IPv4 for the
-        victim-side poison; emit never victimizes it. Our own device is skipped."""
-        if self.net is None:
-            return 0
-        net_id = self._attention_net_id()
-        our_ip = self.net.device_ip or ""
-        gw_ip = self.net.gateway_ipv4 or ""
-        gw_mac = self.net.gateway_mac or ""
-        if gw_mac and gw_ip:
-            self.arbiter.write(
-                DB_ATTENTION,
-                "INSERT OR REPLACE INTO attention(mac, ip, net_id, weight, pinned) "
-                "VALUES(?,?,?,?,1)", (gw_mac, gw_ip, net_id, 1.0))
-        if focused:
-            # picks are already pinned in attention (sync, via select()). They
-            # carry the scent's net_id; normalize EVERY attention row to the
-            # transmitter's net_id so the emission pump's `WHERE net_id=?` filter
-            # includes them — otherwise emit has nothing to poison and the
-            # gauges read flat. One sync UPDATE at fire (not a hot path); all
-            # attention here belongs to the single connected net.
-            self.arbiter.write(
-                DB_ATTENTION, "UPDATE attention SET net_id=? WHERE net_id != ?",
-                (net_id, net_id))
-            rows = self.arbiter.read(
-                DB_ATTENTION, "SELECT mac FROM attention WHERE mac != ?", (gw_mac,))
-            return len(rows)
-        # unfocused: seed every smelled host so identified ones carry a real MAC
-        # (cleaner unicast victim-poison) and the bird can hone them. The WHOLE
-        # subnet is additionally blasted BLIND by the emission pump
-        # (set_whole_subnet_blind in fire()), so the attack lands even on a
-        # client-isolated LAN where smell sees almost nothing. Synchronous write
-        # (one-shot at FIRE, not a hot path).
-        rows = self.arbiter.read(
-            DB_KNOWN_SCENTS,
-            "SELECT mac, ip FROM scents WHERE mac != '' AND ip != ''")
-        for mac, ip in rows:
-            if ip in (our_ip, gw_ip) or mac == gw_mac:
-                continue
-            self.arbiter.write(
-                DB_ATTENTION,
-                "INSERT OR IGNORE INTO attention(mac, ip, net_id, weight, pinned) "
-                "VALUES(?,?,?,1.0,0)", (mac, ip, net_id))
-        # Target count = the whole subnet (blind blast), so FIRE never refuses
-        # while associated even if nothing was smelled. Fall back to the smelled
-        # count if the subnet CIDR is unknown.
-        return self._subnet_host_count(our_ip, gw_ip) or len(rows)
-
-    def _subnet_host_count(self, our_ip: str, gw_ip: str) -> int:
-        cidr = self.net.subnet_cidr if self.net else ""
-        if not cidr:
-            return 0
-        try:
-            import ipaddress
-            net = ipaddress.ip_network(cidr, strict=False)
-            excl = {our_ip, gw_ip,
-                    str(net.network_address), str(net.broadcast_address)}
-            return sum(1 for h in net.hosts() if str(h) not in excl)
-        except ValueError:
-            return 0
-
-    # -- live-gauge survival monitor ----------------------------------------
-    def _iface_mac(self, iface: str) -> str:
-        from engine import rootshell
-        return rootshell.su(f"cat /sys/class/net/{iface}/address").strip()
-
-    def _copy_sniff(self) -> Optional[str]:
-        # TODO(M4): staged the now-deleted sniff.<arch> binary for the ARP
-        # SurvivalMonitor (engine.emission._arch_suffix, removed in M0). The v3
-        # live gauges come from mgmt-TX TXSTATUS instead. No-op.
-        return None
-
-    def _start_passive(self, our_mac: str = "") -> None:
-        # TODO(M4): legacy ARP-listen passive finder (engine.finder_passive,
-        # removed in M0). v3 discovery is monitor recon (engine/recon.py). No-op.
-        return
-
-    def _on_survival(self, sample) -> None:
-        self._survival_sample = sample
-
-    def _start_survival(self, our_mac: str) -> None:
-        # TODO(M4): legacy ARP-survival live gauges (apk/survival_monitor.py,
-        # removed in M0). v3 gauges come from mgmt_tx TXSTATUS acks. No-op.
-        return
-
-    def cease(self) -> None:
-        with self._lock:
-            for svc in ("_bird", "_rsm", "_emission", "_survival", "_passive"):
-                obj = getattr(self, svc, None)
-                if obj is not None:
-                    try:
-                        obj.stop()
-                    except Exception:  # noqa: BLE001
-                        pass
-                    setattr(self, svc, None)
-            self._survival_sample = None
-            if self.mode == Mode.FIRING:
-                self.mode = Mode.LOCKED
-                self.emit("mode", mode=self.mode.value, preset=self.preset.value)
-
-    # =======================================================================
+    # =====================================================================
     # RELEASE / SHUTDOWN
-    # =======================================================================
-    def release(self) -> None:
-        """Give the radio back to Android and stop every service. Safe to re-call.
-        Because we never seized monitor, this only restores the OEM dual-STA /
-        multi-internet knobs to how they were found (no disruptive Wi-Fi toggle,
-        so adb/tailscale on wlan0 survive)."""
+    # =====================================================================
+    def release(self) -> bool:
+        """Give the PHY back to Android and restore the baseline. Safe to re-call.
+        Stops any attack burst and the RECON capture first."""
         with self._lock:
-            self.cease()
-            self._stop_wired_finder()
+            if self._attack_stop is not None:
+                self._attack_stop.set()
+            t = self._attack_thread
+        if t is not None and t.is_alive():
+            t.join(timeout=3.0)
+        with self._lock:
+            self._attack_thread = None
+            self._attack_stop = None
+            self._stop_recon()
             try:
-                self.radio.release_to_android(wait_reconnect=False)
+                self.tx.close()
             except Exception:  # noqa: BLE001
                 pass
-            self.airspaces_list = []
-            self.links = {}
-            self.preset = Preset.NONE
-            self.mode = Mode.IDLE
-            self.emit("mode", mode=self.mode.value, preset=self.preset.value)
+            ok = True
+            try:
+                ok = self.phyguard.release()
+            except Exception as exc:  # noqa: BLE001
+                Logger.error(f"{DEADNET_PREF}: release failed: {exc}")
+                ok = False
+            self.emit("released")
+            self._emit_state()
+            return bool(ok)
 
     def shutdown(self) -> None:
         self.release()
-        try:
-            self.arbiter.close()
-        except Exception:  # noqa: BLE001
-            pass
-
-    # -- helpers ------------------------------------------------------------
-    def _net_summary(self) -> dict:
-        n = self.net
-        if n is None:
-            return {}
-        return {"iface": n.iface, "device_ip": n.device_ip,
-                "subnet": n.subnet_cidr, "gw4": n.gateway_ipv4,
-                "gw6": n.gateway_ipv6, "gw_mac": n.gateway_mac}
 
 
 if __name__ == "__main__":
-    # NOTE: the full associate-first self-test was removed in the v3 M0 teardown —
-    # it exercised the deleted finder / emission / birdobserver / survival engines
-    # and the ARP FIRE / monitor deep-smell code paths, all now stubbed.
-    # TODO(M4): rebuild as an ANDROID<->APP{RECON,ATTACK} state-machine self-test
-    # driving PhyGuard / ReconScanner / AttackController / CapGate (V3_PLAN §15).
-    # This minimal skeleton only confirms the controller still constructs and the
-    # torn-out entry points fail loudly rather than silently half-run.
+    # Off-device state-machine self-test. Every engine collaborator is faked, so
+    # we exercise ANDROID -> RECON -> (select) -> (capgate) -> ATTACK -> RECON ->
+    # RELEASE and assert the transitions + gating without a device or root.
     import tempfile
+    import types
 
     events: List[tuple] = []
 
-    class _FakeRadio:
-        mon_iface = "mon0"
-        def __init__(self): self.state = CardState.ANDROID
-        def ensure_managed(self, **k): self.state = CardState.MANAGED; return True
-        def is_associated(self): return "aa:bb:cc:dd:ee:ff"
-        def release_to_android(self, **k): self.state = CardState.ANDROID; return True
-        def current_ssid(self): return "HomeNet"
-        def secondary_iface(self): return None
-        def link_bssid(self, iface): return None
+    class FakeRadio:
+        def set_channel(self, ch): return True
 
-    ctl = AppController(tempfile.mkdtemp(),
+    class FakePhyGuard:
+        def __init__(self):
+            self.ownership = Ownership.ANDROID
+            self.mode = None
+            self.radio = FakeRadio()
+            self.log = []
+        def own(self, ch=6):
+            self.ownership = Ownership.APP; self.mode = PhyMode.RECON
+            self.log.append(("own", ch)); return True
+        def to_attack(self):
+            self.mode = PhyMode.ATTACK; self.log.append(("to_attack",)); return True
+        def to_recon(self, ch=None):
+            self.mode = PhyMode.RECON; self.log.append(("to_recon", ch)); return True
+        def release(self):
+            self.ownership = Ownership.ANDROID; self.mode = None
+            self.log.append(("release",)); return True
+
+    class FakeScanner:
+        def __init__(self, store):
+            self.store = store; self.started = False; self.stopped = False
+        def start(self):
+            self.started = True
+            # seed a couple of targets as if captured off the air
+            from engine.recon import Target, now_ms
+            self.store.upsert(Target(mac="aa:bb:cc:00:11:22", kind="ap", ssid="HomeNet",
+                                     channel=6, freq=2437, rssi=-40, last_seen_ms=now_ms()))
+            self.store.upsert(Target(mac="11:22:33:44:55:66", kind="ap", ssid="Cafe",
+                                     channel=36, freq=5180, rssi=-60, last_seen_ms=now_ms()))
+        def stop(self):
+            self.stopped = True
+
+    scanners: List[FakeScanner] = []
+    def fake_recon_factory(mon, store, on_target, set_channel):
+        s = FakeScanner(store); scanners.append(s); return s
+
+    class FakeTx:
+        def __init__(self): self.staged = False; self.closed = False
+        def stage(self): self.staged = True; return "/x/nl80211_inject.arm64"
+        def send(self, iface, freq, hexframe, fast=False): return (True, False)
+        def close(self): self.closed = True
+
+    class FakeCap:
+        def __init__(self, patched=True): self._p = patched
+        def check(self, allow_probe=True):
+            return types.SimpleNamespace(patched=self._p, decided_by="probe",
+                                         reason=("patched" if self._p else "stock"))
+
+    tx = FakeTx()
+    pg = FakePhyGuard()
+    ctl = AppController(tempfile.mkdtemp(), phyguard=pg, tx=tx, capgate=FakeCap(True),
+                        recon_factory=fake_recon_factory,
                         on_event=lambda k, d: events.append((k, d)))
-    ctl.radio = _FakeRadio()
 
-    # DETECT still works (no deleted deps): enumerate the associated airspace.
-    assert ctl.detect() is True
-    assert ctl.airspaces_list == [{"iface": "wlan0", "ssid": "HomeNet",
-                                   "bssid": "aa:bb:cc:dd:ee:ff"}], ctl.airspaces_list
-    assert ctl.mode == Mode.IDLE, "detect must not change mode"
+    # 1) ANDROID baseline
+    assert ctl.state is AppState.ANDROID
+    # 2) OWN -> RECON, scanner started, targets appear
+    assert ctl.own_recon(6) is True
+    assert ctl.state is AppState.RECON and scanners[0].started
+    assert ctl.store.count("ap") == 2, ctl.store.count("ap")
+    assert pg.log[0] == ("own", 6)
 
-    # The ARP FIRE and monitor deep-smell paths are torn out pending the M4 rewire.
-    for call in (ctl.fire, ctl.begin_monitor_smell):
-        try:
-            call()
-            raise AssertionError(f"{call.__name__} should raise NotImplementedError")
-        except NotImplementedError:
-            pass
+    # 3) SELECT: index + glob against the recon inventory
+    assert ctl.set_selection("all") == 2
+    assert ctl.set_selection("SHome*") == 1 and ctl.spoof[0].ssid == "HomeNet"
+    assert ctl.set_selection("1,2") == 2
 
-    # RELEASE hands the radio back cleanly even with the services torn out.
-    ctl.release()
-    assert ctl.mode == Mode.IDLE and ctl.radio.state == CardState.ANDROID
-    ctl.arbiter.close()
-    print("AppController (v3 M0 skeleton) PASS")
+    # 4) ATTACK gated by CapGate; patched -> runs, switches to ATTACK, stops recon
+    ctl.set_mode(1); ctl.set_pps(200); ctl.budget = 10
+    assert ctl.start_attack() is True
+    ctl._attack_thread.join(timeout=3.0)
+    assert ("to_attack",) in pg.log, pg.log
+    assert scanners[0].stopped, "recon capture must stop before an attack burst"
+    m = ctl.state_metrics()
+    assert m["sent"] == 10 and m["accepted"] == 10, m
+
+    # 5) stop_attack -> back to RECON (mon re-added, fresh scanner started)
+    ctl.stop_attack(back_to_recon=True)
+    assert pg.mode == PhyMode.RECON and scanners[-1].started
+
+    # 6) CapGate refusal on stock cfg80211 blocks ATTACK
+    ctl2 = AppController(tempfile.mkdtemp(), phyguard=FakePhyGuard(), tx=FakeTx(),
+                         capgate=FakeCap(False), recon_factory=fake_recon_factory,
+                         on_event=lambda k, d: None)
+    ctl2.own_recon(6); ctl2.set_selection("all")
+    assert ctl2.start_attack() is False and ctl2.patched is False
+
+    # 7) RELEASE -> ANDROID, tx closed
+    assert ctl.release() is True
+    assert ctl.state is AppState.ANDROID and tx.closed
+
+    kinds = [k for k, _ in events]
+    for need in ("state", "recon", "selection", "attack_start", "attack_done", "released"):
+        assert need in kinds, (need, kinds)
+    print("AppController (v3 M4 state machine) PASS")
