@@ -394,6 +394,16 @@ warn_on_root = 1
 title = Deadnet Mgmt
 package.name = deadnetmgmt
 #
+#    v3 own-the-PHY build. Canonical v3 identity: installs side-by-side with the
+#    legacy ARP build (org.deadnet.deadnet) and the mgmt build
+#    (org.deadnet.deadnetmgmt) as org.deadnet.deadnet3 — so the old app is not
+#    overwritten while v3 is validated on-device.
+#    Build with: buildozer --profile v3 android debug
+[app@v3]
+title = DeadNet v3
+package.name = deadnet3
+version = 3.0
+#
 #    Then, invoke the command line with the "demo" profile:
 #
 #buildozer --profile demo android debug
