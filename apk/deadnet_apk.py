@@ -12,7 +12,10 @@ from typing import Union
 
 from concurrent.futures import ThreadPoolExecutor
 from utils import *
-from survival_monitor import SurvivalMonitor
+# NOTE: apk/survival_monitor.py (the ARP-survival live gauges) was removed in the
+# v3 M0 teardown. This whole DeadNetAPK class is the legacy ARP/RA attack driver
+# (arp/nra binaries) and is no longer wired into the app; left in place pending the
+# user's call on the legacy CLI/driver (see V3_PLAN §4).
 from android.permissions import request_permissions, Permission
 request_permissions([Permission.WRITE_EXTERNAL_STORAGE, Permission.INTERNET, Permission.ACCESS_WIFI_STATE,
                      Permission.ACCESS_NETWORK_STATE, Permission.ACCESS_FINE_LOCATION, Permission.CHANGE_WIFI_STATE])
@@ -46,7 +49,6 @@ class DeadNetAPK:
         self._arp_sleep_cycle_interval = 10
         self._nra_sleep_interval = 2
         self._loop_sleep_interval = 0.321
-        self._survival_interval_ms = 500
 
         self._arp_bcast_proc: Union[None, subprocess.Popen] = None
         self._nra_proc: Union[None, subprocess.Popen] = None
@@ -55,7 +57,6 @@ class DeadNetAPK:
 
         self.print_mtd = print_mtd
         self.gauge_mtd = gauge_mtd
-        self._survival_monitor: Union[None, SurvivalMonitor] = None
         self._my_mac = get_device_mac_address_su(self._network_interface)
         if self._my_mac == NET_UNDEFINED:
             raise Exception("Failed to get device MAC address")
@@ -184,32 +185,9 @@ class DeadNetAPK:
             except Exception as e:
                 Logger.error(f"{DEADNET_PREF}: Unable to kill {pid}: {e} - {traceback.format_exc()}")
 
-    def _start_survival_monitor(self) -> None:
-        if self.gauge_mtd is None:
-            return
-        try:
-            self._survival_monitor = SurvivalMonitor(
-                sniff_path=self.sniff_path,
-                iface=self._network_interface,
-                gateway_mac=self._gateway_mac,
-                our_mac=self._my_mac,
-                on_sample=self.gauge_mtd,
-                interval_ms=self._survival_interval_ms,
-            )
-            self._survival_monitor.start()
-        except Exception as e:
-            self._survival_monitor = None
-            Logger.error(f"{DEADNET_PREF}: failed to start survival monitor {e} - {traceback.format_exc()}")
-
-    def _stop_survival_monitor(self) -> None:
-        if self._survival_monitor is not None:
-            self._survival_monitor.stop()
-            self._survival_monitor = None
-
     def _start_attack_loop(self) -> None:
         self._ipv4_arp_bcast_attack()
         self._ipv6_nra_attack()
-        self._start_survival_monitor()
 
         start = time.time()
         while not self._abort:
@@ -220,8 +198,6 @@ class DeadNetAPK:
         self._terminate_all_attacks()
 
     def _terminate_all_attacks(self):
-        self._stop_survival_monitor()
-
         self._kill_proc(self._nra_proc, self.nra_path)
         self._nra_proc = None
 

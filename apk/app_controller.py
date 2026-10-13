@@ -213,82 +213,14 @@ class AppController:
         return int(m.group(1)) if m else None
 
     def begin_monitor_smell(self, dwell_s: Optional[float] = None) -> bool:
-        """The 2nd smell modality: briefly drop the association, seize the radio
-        into monitor on the JOINED channel, sniff 802.11 for `dwell_s` seconds
-        (attributing every heard device to its airspace by the BSSID in its
-        frames, filtered to the one we joined), then release + reassociate and
-        resume the normal associated/LOCKED state.
-
-        Unlike active smell this sees client-isolated devices, because monitor
-        reads the air directly instead of asking the router to forward packets.
-        It runs SYNCHRONOUSLY (callers run it on a worker); the radio is offline
-        for the sniff window (USB adb survives, Wi-Fi adb will drop)."""
-        dwell = self.monitor_dwell_s if dwell_s is None else float(dwell_s)
-        with self._lock:
-            bssid = (self.radio.is_associated() or "").strip()
-            ssid = self.radio.current_ssid()
-            if not bssid:
-                self.emit("error", msg="deep smell needs an association — Detect/Smell first")
-                return False
-            channel = self._assoc_channel() or 0
-            try:
-                self.radio.capture_baseline()   # so release restores how it was found
-            except Exception:  # noqa: BLE001
-                pass
-            self.emit("monitor_smelling", ssid=ssid, bssid=bssid, channel=channel,
-                      dwell=int(dwell), warn="radio offline during sniff")
-
-        air = None
-        seized = False
-        try:
-            if channel <= 0 or not self.radio.start_recon(channel):
-                self.emit("error", msg=f"could not seize monitor on ch{channel} (radio busy?)")
-                return False
-            seized = True
-            from engine.finder_air import FinderAir
-            air = FinderAir(self.arbiter, self.radio.mon_iface,
-                            net_id=self._attention_net_id(), bssid_filter=bssid)
-            air.start()
-            t0 = time.time()
-            while True:
-                elapsed = time.time() - t0
-                if elapsed >= dwell:
-                    break
-                self.emit("monitor_progress", elapsed=int(elapsed), total=int(dwell))
-                time.sleep(min(1.0, dwell - elapsed))
-        except Exception as exc:  # noqa: BLE001
-            self.emit("error", msg=f"deep smell failed: {exc}")
-        finally:
-            if air is not None:
-                try:
-                    air.stop()
-                except Exception:  # noqa: BLE001
-                    pass
-            if seized:
-                try:
-                    self.radio.release_to_android(wait_reconnect=True)
-                except Exception:  # noqa: BLE001
-                    pass
-        # Reconnect: on this phone, monitor churn in dual-STA/Wi-Fi-Aware mode
-        # wedges the framework's auto-join — svc/cmd/wpa_cli all fail to re-select
-        # the saved network; only an explicit connect (the Settings network tap)
-        # recovers it. So if release did not get us back on, pop the Android Wi-Fi
-        # panel for a one-tap manual rejoin instead of hanging on a dead auto-join.
-        if not self.radio.is_associated():
-            try:
-                from engine import rootshell
-                rootshell.su("am start -a android.settings.WIFI_SETTINGS")
-            except Exception:  # noqa: BLE001
-                pass
-            self.emit("monitor_done", found=len(self.scents()),
-                      reconnect="tap your Wi-Fi network to resume, then Smell/Fire")
-            return False
-        # Back on the air: re-establish the normal associated/LOCKED state so the
-        # monitor-captured scents are ready to FIRE. begin_smell re-discovers the
-        # subnet, restarts the wired finder, and emits smelling/mode for the UI.
-        ok = self.begin_smell(adhd=self.adhd)
-        self.emit("monitor_done", found=len(self.scents()))
-        return ok
+        """Legacy monitor-mode "deep smell" — seized a monitor vif and ran the
+        now-deleted engine.finder_air.FinderAir over it. Removed in the v3 M0
+        teardown; monitor discovery is replaced by engine/recon.py (ReconScanner)
+        running under PhyGuard RECON ownership."""
+        # TODO(M4): rebuild as RECON mode — PhyGuard.own()/to_recon() + ReconScanner
+        # populating the target store (see V3_PLAN §6, §15 wiring seams).
+        raise NotImplementedError(
+            "monitor deep-smell removed in v3 M0; rebuilt on engine/recon.py in M4")
 
     def _link_summary(self, wanted_second: bool) -> dict:
         """Describe the associated link(s) and which mode we actually got."""
@@ -307,32 +239,15 @@ class AppController:
         }
 
     def _start_wired_finder(self) -> None:
-        from engine.finder import Finder, NetFetcher
-        self._finder = Finder(
-            self.arbiter, self.managed_iface, self.net,
-            on_progress=lambda ph, d, t: self.emit("scan", phase=int(ph.value), done=d, total=t))
-        # P1 smell is the important pass; run it on a worker so the UI stays live.
-        threading.Thread(target=self._run_scan, name="wired-finder", daemon=True).start()
-        # Mac-Vacuum keeps the master store fresh as leases rotate.
-        self._netfetcher = NetFetcher(
-            self.arbiter, self.managed_iface, self.net,
-            interval_ms=self.knobs.mac_vacuum_interval_ms)
-        # NetFetcher gates its tick on `self.net.iface in focus`, so the focus
-        # set must be keyed by iface (the canonical net_id), NOT subnet_cidr —
-        # otherwise the membership test never matches and the mac-vacuum never
-        # runs.
-        self._netfetcher.set_focus_nets([self._attention_net_id()])
-        self._netfetcher.start()
+        # TODO(M4): the legacy engine.finder subnet sweep + NetFetcher mac-vacuum
+        # were removed in the v3 M0 teardown. v3 discovery is monitor-based
+        # (engine/recon.py ReconScanner), not an associated L3 sweep. No-op so the
+        # begin_smell() skeleton still runs; rewire to RECON in M4.
+        return
 
     def _run_scan(self) -> None:
-        try:
-            self._finder.phase1_smell()
-            if self.knobs.scan_phases.value >= ScanPhase.P2_FINGERPRINT.value:
-                self._finder.phase2_fingerprint()
-            self.emit("scan_done")
-        except Exception as exc:  # noqa: BLE001
-            Logger.error(f"{DEADNET_PREF}: scan failed {exc}")
-            self.emit("error", msg=f"scan failed: {exc}")
+        # TODO(M4): legacy finder scan worker (engine.finder, removed in M0).
+        return
 
     def _stop_wired_finder(self) -> None:
         if self._netfetcher is not None:
@@ -398,77 +313,15 @@ class AppController:
         self.emit("fork", focused=self.focused)
 
     def fire(self, focused: Optional[bool] = None, on_stats=None) -> bool:
-        """Launch the native emitter on the associated link with the BirdObserver
-        airborne + the 100 ms rehydrator + the live-gauge SurvivalMonitor. Requires
-        an associated, smelling link (Mode.LOCKED).
-
-        focused=True  -> aim only at the electronics the owner picked.
-        focused=False -> aim at every electronic smelled on the airspace (baseline),
-                         letting the bird hone onto any that keep leaking.
-        """
-        with self._lock:
-            if self.mode != Mode.LOCKED:
-                self.emit("error", msg="FIRE needs an associated, smelling link")
-                return False
-            focused = self.focused if focused is None else bool(focused)
-            self.focused = focused
-            from engine.emission import EmissionController
-            from engine.birdobserver import BirdObserver
-
-            # Seed the attention/focus set. emit.cpp only transmits at focus
-            # entries, so an empty set would send nothing. The bird hones in BOTH
-            # forks, so the emitter always runs per-host (EmitMode.FOCUSED); the
-            # fork only decides WHICH hosts seed the set.
-            n_targets = self._seed_targets(focused)
-            self.knobs.emit_mode = EmitMode.FOCUSED
-            if n_targets == 0:
-                self.emit("error", msg=(
-                    "nothing to aim at — pick electronics (focused) or let the "
-                    "smell finish (unfocused)"))
-                return False
-            our_mac = self._iface_mac(self.managed_iface)
-            self._emission = EmissionController(self.arbiter, self.appdir, self.knobs)
-            # Pin the transmitter's pump filter to the SAME net_id the attention
-            # rows carry (iface-keyed), so focused picks are not filtered out of
-            # the focus buffer.
-            self._emission.add_transmitter(
-                self.managed_iface, self.net, our_mac=our_mac,
-                net_id=self._attention_net_id())
-            # UNFOCUSED = blast the WHOLE computed subnet blind (vanilla-style),
-            # so the attack lands even on a client-isolated LAN where smell sees
-            # almost nothing. FOCUSED stays limited to the owner's picks.
-            if not focused and self.net is not None:
-                self._emission.set_whole_subnet_blind(
-                    self.net.subnet_cidr,
-                    our_ip=self.net.device_ip or "",
-                    gw_ip=self.net.gateway_ipv4 or "")
-            self._emission.start()  # also starts its own 100 ms rehydrator
-
-            # feed the sniffer-sourced escaped-envelope counts into that rehydrator
-            if on_stats is not None and getattr(self._emission, "_rehydrator", None):
-                self._emission._rehydrator.set_escaped_source(on_stats)
-
-            # Live gauges: the native `sniff` binary on the associated link counts
-            # our ARP TX, surviving (leaked) packets and dead-MAC evidence — the
-            # proven survival-gauges feed. It measures the aggregate regardless of
-            # focus set, so the gauges work in focused AND unfocused fire.
-            self._start_survival(our_mac)
-
-            # Passive discovery: listen to ARP on the associated link while we
-            # fire. ARP is link-layer broadcast (reaches us even under client
-            # isolation that silently drops active probes), and the poison
-            # provokes victims to re-ARP — so the attack itself populates the
-            # electronic list with hosts active smell could never knock awake.
-            self._start_passive(our_mac=our_mac)
-
-            if self.knobs.bird_airborne:
-                self._bird = BirdObserver(self.arbiter, self.knobs)
-                self._bird.start()
-
-            self.mode = Mode.FIRING
-            self.emit("mode", mode=self.mode.value, preset=self.preset.value,
-                      focused=focused)
-            return True
+        """Legacy ARP FIRE — launched the native emitter (engine.emission) with the
+        BirdObserver (engine.birdobserver), the SurvivalMonitor live gauges and the
+        passive ARP finder. The whole ARP-poison transport was removed in the v3 M0
+        teardown; v3 attacks with scheduled 802.11 mgmt-TX instead."""
+        # TODO(M4): rebuild as ATTACK mode — select_spoof() over the recon target
+        # store -> AttackController(mgmt_tx.send, ensure_attack=phyguard.to_attack)
+        # with CapGate gating the patched cfg80211 (see V3_PLAN §6, §15).
+        raise NotImplementedError(
+            "ARP FIRE removed in v3 M0; rebuilt on engine/attack.py mgmt-TX in M4")
 
     def state_metrics(self) -> dict:
         """Metrics for the gauges (polled on a Clock tick). Preferred source is the
@@ -577,61 +430,23 @@ class AppController:
         return rootshell.su(f"cat /sys/class/net/{iface}/address").strip()
 
     def _copy_sniff(self) -> Optional[str]:
-        """Copy sniff.<arch> into appdir (root-owned, +x), mirroring emission's
-        binary prep. Returns the on-device path, or None if unavailable."""
-        try:
-            import os
-            from engine import rootshell
-            from engine.emission import _arch_suffix
-            # assets live beside this file (apk/assets), not under appdir
-            here = os.path.dirname(os.path.abspath(__file__))
-            src = os.path.join(here, "assets", f"sniff.{_arch_suffix()}")
-            dst = os.path.join(self.appdir, f"sniff.{_arch_suffix()}")
-            # one persistent-shell round-trip (was three separate su -c forks)
-            rc, out = rootshell.su_rc(
-                f"cp -rf {src} {dst} && chmod 777 {dst} && chown root {dst}")
-            if rc != 0:
-                Logger.error(f"{DEADNET_PREF}: sniff copy failed rc={rc} {out!r}")
-                return None
-            return dst
-        except Exception as exc:  # noqa: BLE001
-            Logger.error(f"{DEADNET_PREF}: sniff copy failed {exc}")
-            return None
+        # TODO(M4): staged the now-deleted sniff.<arch> binary for the ARP
+        # SurvivalMonitor (engine.emission._arch_suffix, removed in M0). The v3
+        # live gauges come from mgmt-TX TXSTATUS instead. No-op.
+        return None
 
     def _start_passive(self, our_mac: str = "") -> None:
-        """Start the ARP-listen passive finder on the associated link (discovery
-        that works under client isolation). Best-effort: a failure never blocks fire.
-        our_mac is passed so the finder drops OUR OWN injected poison (ether src ==
-        our_mac) — otherwise the blind-/24 blast's random dead MACs balloon the
-        scent store and crash the app."""
-        try:
-            from engine.finder_passive import PassiveFinder
-            self._passive = PassiveFinder(
-                self.arbiter, self.managed_iface, net_id=self._attention_net_id(),
-                our_mac=our_mac,
-                subnet_cidr=(self.net.subnet_cidr if self.net else ""))
-            self._passive.start()
-        except Exception as exc:  # noqa: BLE001
-            Logger.error(f"{DEADNET_PREF}: passive finder failed to start {exc}")
-            self._passive = None
+        # TODO(M4): legacy ARP-listen passive finder (engine.finder_passive,
+        # removed in M0). v3 discovery is monitor recon (engine/recon.py). No-op.
+        return
 
     def _on_survival(self, sample) -> None:
         self._survival_sample = sample
 
     def _start_survival(self, our_mac: str) -> None:
-        try:
-            from survival_monitor import SurvivalMonitor
-        except Exception as exc:  # noqa: BLE001
-            Logger.error(f"{DEADNET_PREF}: SurvivalMonitor import failed {exc}")
-            return
-        sniff = self._copy_sniff()
-        if not sniff:
-            return
-        gw = (self.net.gateway_mac if self.net else "") or ""
-        self._survival_sample = None
-        self._survival = SurvivalMonitor(
-            sniff, self.managed_iface, gw, our_mac, on_sample=self._on_survival)
-        self._survival.start()
+        # TODO(M4): legacy ARP-survival live gauges (apk/survival_monitor.py,
+        # removed in M0). v3 gauges come from mgmt_tx TXSTATUS acks. No-op.
+        return
 
     def cease(self) -> None:
         with self._lock:
@@ -687,163 +502,47 @@ class AppController:
 
 
 if __name__ == "__main__":
-    # Off-device state-machine self-test: the device-touching engine services are
-    # stubbed; we verify the associate-first lifecycle + focused/unfocused fire gating.
+    # NOTE: the full associate-first self-test was removed in the v3 M0 teardown —
+    # it exercised the deleted finder / emission / birdobserver / survival engines
+    # and the ARP FIRE / monitor deep-smell code paths, all now stubbed.
+    # TODO(M4): rebuild as an ANDROID<->APP{RECON,ATTACK} state-machine self-test
+    # driving PhyGuard / ReconScanner / AttackController / CapGate (V3_PLAN §15).
+    # This minimal skeleton only confirms the controller still constructs and the
+    # torn-out entry points fail loudly rather than silently half-run.
     import tempfile
 
     events: List[tuple] = []
-    ctl = AppController(tempfile.mkdtemp(),
-                        on_event=lambda k, d: events.append((k, d)))
 
-    # stub the radio + engine services so nothing touches a device
     class _FakeRadio:
         mon_iface = "mon0"
-        def __init__(self): self.state = CardState.ANDROID; self.recon_ch = None
+        def __init__(self): self.state = CardState.ANDROID
         def ensure_managed(self, **k): self.state = CardState.MANAGED; return True
         def is_associated(self): return "aa:bb:cc:dd:ee:ff"
         def release_to_android(self, **k): self.state = CardState.ANDROID; return True
         def current_ssid(self): return "HomeNet"
         def secondary_iface(self): return None
         def link_bssid(self, iface): return None
-        def capture_baseline(self): return {}
-        def restore_baseline(self): pass
-        def set_dual_sta(self, on): pass
-        def start_recon(self, channel=6): self.state = CardState.MONITOR; self.recon_ch = channel; return True
+
+    ctl = AppController(tempfile.mkdtemp(),
+                        on_event=lambda k, d: events.append((k, d)))
     ctl.radio = _FakeRadio()
 
-    _NET = NetInfo(iface="wlan0", device_ip="192.168.1.50", cidr=24,
-                   subnet_cidr="192.168.1.0/24", gateway_ipv4="192.168.1.1",
-                   gateway_ipv6="fe80::1", gateway_mac="aa:bb:cc:00:00:01")
-    import engine.iface as _if
-    _if.discover_iface_net = lambda iface: _NET
-
-    class _FakeFinder:
-        def __init__(self, *a, **k): pass
-        def phase1_smell(self): return []
-        def phase2_fingerprint(self, *a, **k): pass
-    class _FakeNetFetcher:
-        def __init__(self, *a, **k): pass
-        def set_focus_nets(self, *a): pass
-        def start(self): pass
-        def stop(self): pass
-    import engine.finder as _f
-    _f.Finder = _FakeFinder
-    _f.NetFetcher = _FakeNetFetcher
-
-    class _FakeEmission:
-        def __init__(self, *a, **k): self._rehydrator = None; self.blind = None
-        def add_transmitter(self, *a, **k): pass
-        def set_whole_subnet_blind(self, cidr, our_ip="", gw_ip=""):
-            self.blind = cidr; return 0
-        def start(self): pass
-        def stop(self): pass
-    class _FakeBird:
-        def __init__(self, *a, **k): pass
-        def start(self): pass
-        def stop(self): pass
-    import engine.emission as _em
-    import engine.birdobserver as _bo
-    _em.EmissionController = _FakeEmission
-    _bo.BirdObserver = _FakeBird
-
-    # passive ARP finder + monitor-mode air finder: stub so no real `su`/tcpdump
-    class _FakeCapture:
-        started = []
-        def __init__(self, *a, **k): self.a = a; self.k = k; self._on = False
-        def start(self): self._on = True; _FakeCapture.started.append(self.k.get("net_id") or self.a)
-        def stop(self): self._on = False
-    import engine.finder_passive as _fp
-    import engine.finder_air as _fa
-    _fp.PassiveFinder = _FakeCapture
-    _fa.FinderAir = _FakeCapture
-    # survival monitor is imported lazily inside _start_survival; stub the module
-    import sys as _sys
-    import types as _types
-    _sm = _types.ModuleType("survival_monitor")
-    class _FakeSurv:
-        def __init__(self, *a, **k): pass
-        def start(self): pass
-        def stop(self): pass
-    _sm.SurvivalMonitor = _FakeSurv
-    _sys.modules["survival_monitor"] = _sm
-    ctl._copy_sniff = lambda: "/tmp/sniff"   # pretend the binary is staged
-
-    # 1) FIRE must be refused while not locked
-    assert ctl.fire() is False
-
-    # 2) DETECT: enumerate the associated airspace (no seize)
+    # DETECT still works (no deleted deps): enumerate the associated airspace.
     assert ctl.detect() is True
     assert ctl.airspaces_list == [{"iface": "wlan0", "ssid": "HomeNet",
                                    "bssid": "aa:bb:cc:dd:ee:ff"}], ctl.airspaces_list
-    assert ctl.mode == Mode.IDLE, "detect must not change radio mode"
+    assert ctl.mode == Mode.IDLE, "detect must not change mode"
 
-    # 3) SMELL: associate-ensure + discover + wired finder
-    assert ctl.begin_smell(adhd=True) is True
-    assert ctl.mode == Mode.LOCKED and ctl.net.subnet_cidr == "192.168.1.0/24"
-    assert ctl.links["mode"] == "single"  # fake has no wlan1
-    assert ctl.links["wlan0"]["ssid"] == "HomeNet"
+    # The ARP FIRE and monitor deep-smell paths are torn out pending the M4 rewire.
+    for call in (ctl.fire, ctl.begin_monitor_smell):
+        try:
+            call()
+            raise AssertionError(f"{call.__name__} should raise NotImplementedError")
+        except NotImplementedError:
+            pass
 
-    # 4) seed a couple of scents
-    ctl.arbiter.write(DB_KNOWN_SCENTS,
-                      "INSERT OR REPLACE INTO scents(mac, ip, vendor, net_id, last_seen_ms) "
-                      "VALUES(?,?,?,?,?)", ("de:ad:00:00:00:01", "192.168.1.77", "Apple", "lan", now_ms()))
-    ctl.arbiter.write(DB_KNOWN_SCENTS,
-                      "INSERT OR REPLACE INTO scents(mac, ip, vendor, net_id, last_seen_ms) "
-                      "VALUES(?,?,?,?,?)", ("de:ad:00:00:00:02", "192.168.1.78", "Apple", "lan", now_ms()))
-    ctl.arbiter.write(DB_KNOWN_SCENTS,
-                      "INSERT OR REPLACE INTO scents(mac, ip, vendor, net_id, last_seen_ms) "
-                      "VALUES(?,?,?,?,?)", ("de:ad:00:00:00:03", "192.168.1.79", "", "lan", now_ms()))
-    assert len(ctl.scents()) == 3
-    groups = dict(ctl.scent_groups())
-    assert len(groups["Apple"]) == 2 and len(groups["unknown"]) == 1, ctl.scent_groups()
-
-    # 5) UNFOCUSED fire: every smelled host seeds the set (3 victims), bird airborne
-    assert ctl.fire(focused=False) is True
-    assert ctl.mode == Mode.FIRING
-    assert ctl.knobs.emit_mode == EmitMode.FOCUSED, "emit always per-host so bird hones"
-    victims = [r["mac"] for r in ctl.selected() if r["mac"] != "aa:bb:cc:00:00:01"]
-    assert len(victims) == 3, victims
-    assert ctl._emission.blind == "192.168.1.0/24", "unfocused must blast whole subnet blind"
-    assert "wlan0" in _FakeCapture.started, "passive ARP finder must ride along during fire"
-    assert ctl._passive is not None, "passive finder must be live while firing"
-    ctl.cease()
-    assert ctl.mode == Mode.LOCKED
-    assert ctl._passive is None, "cease() must stop the passive finder"
-
-    # 6) FOCUSED fire: only the owner's picks seed the set
-    ctl.clear_selection()
-    ctl.select("de:ad:00:00:00:01")
-    assert ctl.fire(focused=True) is True
-    victims = [r["mac"] for r in ctl.selected() if r["mac"] != "aa:bb:cc:00:00:01"]
-    assert victims == ["de:ad:00:00:00:01"], victims
-    assert ctl._emission.blind is None, "focused must NOT blast the whole subnet"
-    ctl.cease()
-
-    # 7) FOCUSED with no picks is refused (nothing to aim at)
-    ctl.clear_selection()
-    assert ctl.fire(focused=True) is False
-
-    # 8) DEEP (monitor) SMELL: seize monitor on the joined channel, sniff, release,
-    #    reassociate, and come back LOCKED and ready to fire.
-    ctl._assoc_channel = lambda: 11          # avoid touching a real `iw`
-    _FakeCapture.started = []
-    mon_events = []
-    _prev_emit = ctl._emit
-    ctl._emit = lambda k, d: (mon_events.append(k), _prev_emit(k, d))
-    assert ctl.begin_monitor_smell(dwell_s=0) is True
-    assert ctl.radio.recon_ch == 11, "monitor must lock to the joined channel"
-    assert ctl.mode == Mode.LOCKED, "deep smell must leave us ready to fire"
-    assert "monitor_smelling" in mon_events and "monitor_done" in mon_events, mon_events
-    assert _FakeCapture.started, "monitor sniff (FinderAir) must have started"
-    ctl._emit = _prev_emit
-
-    # 8) release -> IDLE, radio handed back
+    # RELEASE hands the radio back cleanly even with the services torn out.
     ctl.release()
     assert ctl.mode == Mode.IDLE and ctl.radio.state == CardState.ANDROID
-    assert ctl.airspaces_list == []
-
-    kinds = [k for k, _ in events]
-    assert "detected" in kinds and "smelling" in kinds and "mode" in kinds
     ctl.arbiter.close()
-    print("modes seen:", [d.get("mode") for k, d in events if k == "mode"])
-    print("AppController (associate-first) PASS")
+    print("AppController (v3 M0 skeleton) PASS")
