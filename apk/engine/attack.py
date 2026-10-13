@@ -51,21 +51,74 @@ DEADNET_PREF = "DeadNet"
 MIN_PPS, MAX_PPS = 10, 1000
 RE_CHARS_RE = re.compile(r"[.^$+|(){}]")  # regex-only metachars -> ERE matcher
 
-# attack catalogue (mode id -> human label); 12 = custom hex, 0/NUKE = wildcard
-ATTACK_MODES: Dict[int, str] = {
-    1: "deauth (broadcast, from AP)",
-    2: "deauth (directed, AP<->sta)",
-    3: "disassoc (broadcast, from AP)",
-    4: "disassoc (directed, AP<->sta)",
-    5: "probe-request flood",
-    6: "auth flood",
-    7: "assoc-request flood",
-    8: "public action (cat 04)",
-    9: "vendor action (cat 7f)",
-    10: "non-public action (cat 00)",
-    11: "beacon / probe-resp spoof",
-    12: "custom hex frame",
+# --- attack catalogue: label + plain-language description + the knobs each mode
+# actually consumes (so the UI can show only the relevant fields). Knob keys map
+# to MgmtCtx fields: reason, cli (target client), ssid, fake (spoofed source),
+# payload (action body), hex (raw frame). 0 = NUKE wildcard, 12 = custom hex.
+@dataclass(frozen=True)
+class ModeSpec:
+    id: int
+    label: str
+    desc: str
+    knobs: Tuple[str, ...] = ()
+
+
+ATTACK_CATALOG: Dict[int, ModeSpec] = {
+    0: ModeSpec(0, "NUKE (wildcard deauth/disassoc)",
+                "Rotates broadcast deauth + disassoc across every detected AP. "
+                "Aim it at a network you own — it clears all of them.", ("reason",)),
+    1: ModeSpec(1, "deauth (broadcast, from AP)",
+                "Broadcast deauth spoofed as the AP — kicks every client off it.",
+                ("reason",)),
+    2: ModeSpec(2, "deauth (directed, AP<->client)",
+                "Targeted deauth between the AP and one client — drops just that client.",
+                ("cli", "reason")),
+    3: ModeSpec(3, "disassoc (broadcast, from AP)",
+                "Broadcast disassociation spoofed as the AP — ends every client's session.",
+                ("reason",)),
+    4: ModeSpec(4, "disassoc (directed, AP<->client)",
+                "Targeted disassociation for one client.", ("cli", "reason")),
+    5: ModeSpec(5, "probe-request flood",
+                "Floods probe requests for an SSID from a spoofed source — fake clients looking for a net.",
+                ("ssid", "fake")),
+    6: ModeSpec(6, "auth flood",
+                "Floods authentication frames at the AP from a spoofed source — fills its client table.",
+                ("fake",)),
+    7: ModeSpec(7, "assoc-request flood",
+                "Floods association requests at the AP from a spoofed source.",
+                ("ssid", "fake")),
+    8: ModeSpec(8, "public action (cat 04)",
+                "802.11 public action frame (category 4) — a protocol-level poke at the target.",
+                ("payload",)),
+    9: ModeSpec(9, "vendor action (cat 7f)",
+                "Vendor-specific action frame (category 127) with a custom payload.",
+                ("payload",)),
+    10: ModeSpec(10, "non-public action (cat 00)",
+                 "Spectrum-management action frame (category 0).", ("payload",)),
+    11: ModeSpec(11, "beacon / probe-resp spoof",
+                 "Advertises a fake AP by spoofing beacons / probe responses for an SSID.",
+                 ("ssid",)),
+    12: ModeSpec(12, "custom hex frame",
+                 "Transmits a raw 802.11 management frame you supply as hex.", ("hex",)),
 }
+
+# back-compat: mode id -> label
+ATTACK_MODES: Dict[int, str] = {k: v.label for k, v in ATTACK_CATALOG.items() if k != 0}
+
+
+def mode_knobs(mode: int) -> Tuple[str, ...]:
+    spec = ATTACK_CATALOG.get(int(mode))
+    return spec.knobs if spec else ()
+
+
+def mode_desc(mode: int) -> str:
+    spec = ATTACK_CATALOG.get(int(mode))
+    return spec.desc if spec else ""
+
+
+def mode_label(mode: int) -> str:
+    spec = ATTACK_CATALOG.get(int(mode))
+    return spec.label if spec else "attack"
 
 
 # ---------------------------------------------------------------------------
@@ -225,9 +278,9 @@ def sched_builder(mode: int, ctx: MgmtCtx) -> BuildFn:
     return _b
 
 
-def nuke_builder() -> BuildFn:
+def nuke_builder(ctx: MgmtCtx) -> BuildFn:
     def _b(idx: int, tgt: MgmtTarget, tog: int) -> str:
-        return bld_nuke(tgt.mac, tog)
+        return bld_nuke(tgt.mac, tog, ctx.reason)
     return _b
 
 
@@ -322,7 +375,7 @@ class AttackController:
                 self.ensure_attack()
             except Exception as exc:  # noqa: BLE001
                 Logger.error(f"{DEADNET_PREF}: ensure_attack failed: {exc}")
-        builder = nuke_builder() if plan.nuke else sched_builder(plan.mode, ctx)
+        builder = nuke_builder(ctx) if plan.nuke else sched_builder(plan.mode, ctx)
         return sched_run(self.send_fn, plan.iface, plan.spoof, plan.budget,
                          plan.pps, plan.title, builder, on_tick, stop, dry)
 

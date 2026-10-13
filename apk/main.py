@@ -7,12 +7,13 @@ AppController (app_controller.py):
   RECON   — OWN PHY (seize monitor, Android guarded) + live target inventory;
             CapGate status; RELEASE.
   SELECT  — pick targets (single / comma / S<pattern>) against the recon list.
-  ATTACK  — mode picker (1-12 + NUKE) + pps; FIRE/STOP; live TXSTATUS gauges
-            (frames SENT, ACCEPTED by the kernel, target PPS).
+  ATTACK  — mode picker (1-12 + NUKE) with a per-action knob panel (only the
+            fields a mode uses) + plain-language description; pps + burst;
+            FIRE/STOP; two live gauges (ACCEPTED % and actual RATE).
 
 Thin shell: all orchestration + device calls live in AppController / engine.
-Release-back of the PHY to Android is guaranteed (PhyGuard atexit/signal +
-on_stop()).
+A burst keeps running while backgrounded (on_pause); STOP is the one authority
+that halts it (instant — it interrupts any in-flight send).
 """
 import subprocess
 import threading
@@ -25,11 +26,12 @@ from kivy.logger import Logger, LOG_LEVELS
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
 from kivy.uix.button import Button
+from kivy.uix.textinput import TextInput
 from kivymd.toast.kivytoast import toast
 
 from gauge import Gauge  # noqa: F401  (registers <Gauge> for main.kv)
 from app_controller import AppController, AppState
-from engine.attack import ATTACK_MODES
+from engine.attack import ATTACK_CATALOG, mode_desc, mode_knobs
 
 try:
     from jnius import autoclass  # noqa: F401  (present only on-device)
@@ -40,11 +42,20 @@ except Exception:
 Logger.setLevel(LOG_LEVELS["info"])
 DEADNET_PREF = "DeadNet"
 
-NUKE_LABEL = "NUKE (wildcard deauth/disassoc)"
-# spinner label -> attack-mode id (0 = NUKE)
-_MODE_BY_LABEL = {ATTACK_MODES[i]: i for i in sorted(ATTACK_MODES)}
-_MODE_BY_LABEL[NUKE_LABEL] = 0
-_MODE_LABELS = [ATTACK_MODES[i] for i in sorted(ATTACK_MODES)] + [NUKE_LABEL]
+# spinner order: modes 1..12 then NUKE (id 0) last; labels straight from catalogue
+_MODE_IDS = [i for i in sorted(ATTACK_CATALOG) if i != 0] + [0]
+_MODE_LABELS = [ATTACK_CATALOG[i].label for i in _MODE_IDS]
+_MODE_BY_LABEL = {ATTACK_CATALOG[i].label: i for i in _MODE_IDS}
+
+# per-knob UI metadata: key -> (caption, hint, int-only)
+_KNOB_META = {
+    "cli":     ("target client MAC", "aa:bb:cc:dd:ee:ff", False),
+    "fake":    ("spoofed source",    "blank = 02:00:00:00:00:01", False),
+    "ssid":    ("SSID",              "network name (blank = target's)", False),
+    "hex":     ("custom frame (hex)", "e.g. c0000000ffffffffffff...", False),
+    "payload": ("payload (hex)",     "optional action body", False),
+    "reason":  ("reason code",       "0 = default (7 deauth / 8 disassoc)", True),
+}
 
 
 class MainApp(MDApp):
@@ -52,7 +63,6 @@ class MainApp(MDApp):
         super().__init__(**kwargs)
         self.ctl = None
         self._root_ok = self._try_root()
-        self._peaks = {"sent": 1.0, "pps": 1.0}
 
     # -- lifecycle ----------------------------------------------------------
     def on_start(self):
@@ -64,15 +74,19 @@ class MainApp(MDApp):
         self.ctl = AppController(appdir, managed_iface="wlan0", mon_iface="mon0",
                                  on_event=self._on_event)
         self.root.ids.mode_spinner.values = _MODE_LABELS
+        self.on_mode_pick(self.root.ids.mode_spinner.text)   # seed desc + knobs
         self._refresh_status()
         Clock.schedule_interval(self._tick, 0.5)
 
+    def on_pause(self):
+        # keep running while backgrounded — a burst in flight must NOT be torn
+        # down just because the app lost focus (stopping is the STOP button's job)
+        return True
+
     def on_stop(self):
-        if self.ctl is not None:
-            try:
-                self.ctl.shutdown()
-            except Exception as exc:  # noqa: BLE001
-                Logger.error(f"{DEADNET_PREF}: shutdown on_stop {exc}")
+        # intentionally does NOT stop an attack: closing the app ends the process
+        # (and with it the burst); we don't add fragile lifecycle teardown.
+        return
 
     @staticmethod
     def _try_root() -> bool:
@@ -233,10 +247,48 @@ class MainApp(MDApp):
 
     # -- §3 ATTACK ----------------------------------------------------------
     def on_mode_pick(self, label):
-        if self.ctl is None:
+        if self.ctl is None or self.root is None:
             return
         mode = _MODE_BY_LABEL.get(label, 1)
         self.ctl.set_mode(mode)
+        self.root.ids.mode_desc.text = mode_desc(mode)
+        self._build_knobs(mode_knobs(mode))
+
+    def _build_knobs(self, knobs):
+        """Rebuild the per-action knob panel to show only this mode's fields."""
+        panel = self.root.ids.knob_panel
+        panel.clear_widgets()
+        for key in knobs:
+            caption, hint, int_only = _KNOB_META.get(key, (key, "", False))
+            row = BoxLayout(orientation="horizontal", size_hint_y=None, height=62,
+                            spacing=10)
+            lab = Label(text=caption, markup=True, font_size=18, halign="left",
+                        valign="middle", size_hint_x=None, width=240,
+                        color=(0.75, 0.78, 0.9, 1))
+            lab.bind(size=lambda w, v: setattr(w, "text_size", (w.width, None)))
+            ti = TextInput(hint_text=hint, multiline=False, font_size=22,
+                           input_filter=("int" if int_only else None),
+                           text=self._knob_initial(key))
+            ti.bind(on_text_validate=lambda inst, k=key: self._apply_knob(k, inst.text),
+                    focus=lambda inst, val, k=key: (None if val else self._apply_knob(k, inst.text)))
+            row.add_widget(lab)
+            row.add_widget(ti)
+            panel.add_widget(row)
+
+    def _knob_initial(self, key):
+        c = self.ctl
+        return {"cli": getattr(c, "knob_cli", ""), "fake": getattr(c, "knob_fake", ""),
+                "ssid": getattr(c, "knob_ssid", ""), "hex": getattr(c, "knob_hex", ""),
+                "payload": getattr(c, "knob_payload", ""),
+                "reason": (str(c.knob_reason) if getattr(c, "knob_reason", 0) else "")}.get(key, "")
+
+    def _apply_knob(self, key, value):
+        if self.ctl is None:
+            return
+        {"cli": self.ctl.set_client, "fake": self.ctl.set_fake,
+         "ssid": self.ctl.set_ssid, "hex": self.ctl.set_custom_hex,
+         "payload": self.ctl.set_payload, "reason": self.ctl.set_reason
+         }.get(key, lambda _v: None)(value)
 
     def on_pps(self, text):
         if self.ctl is None:
@@ -245,6 +297,14 @@ class MainApp(MDApp):
             self.ctl.set_pps(int(float(text)))
         except (TypeError, ValueError):
             pass
+
+    def on_budget(self, text):
+        if self.ctl is None:
+            return
+        try:
+            self.ctl.set_budget(int(float(text)))
+        except (TypeError, ValueError):
+            self.ctl.set_budget(0)
 
     def on_fire(self):
         if self.ctl is None:
@@ -268,33 +328,25 @@ class MainApp(MDApp):
             self._render_targets()
 
     def _update_gauges(self, m):
-        sent = self.root.ids.cell_sent
-        sent.gauge_value = m["sent"]
-        sent.gauge_max = self._auto("sent", m["sent"], 50.0)
-        sent.big_text = str(int(m["sent"]))
-
+        # ACCEPTED — accepted/sent as a percentage (full green = kernel took all)
         acc = self.root.ids.cell_acc
-        acc.gauge_value = m["accepted"]
-        acc.gauge_max = max(1, m["sent"])
-        acc.big_text = str(int(m["accepted"]))
-        if m["sent"] and m["accepted"] >= m["sent"]:
-            acc.arc_rgba = [0.07, 0.69, 0.07, 1]
-            acc.big_rgba = [0.07, 0.69, 0.07, 1]
+        pct = m["accept_pct"]
+        acc.gauge_value = pct
+        acc.gauge_max = 100
+        acc.big_text = f"{pct}%"
+        if m["sent"] and m["miss"] == 0:
+            acc.arc_rgba = acc.big_rgba = [0.07, 0.69, 0.07, 1]
             acc.caption_text = "all accepted"
         else:
-            acc.arc_rgba = [0.82, 0.55, 0.11, 1]
-            acc.big_rgba = [0.82, 0.55, 0.11, 1]
+            acc.arc_rgba = acc.big_rgba = [0.82, 0.55, 0.11, 1]
             acc.caption_text = f"{m['miss']} rejected"
 
-        pps = self.root.ids.cell_pps
-        pps.gauge_value = m["pps"]
-        pps.gauge_max = self._auto("pps", m["pps"], 100.0)
-        pps.big_text = str(int(m["pps"]))
-
-    def _auto(self, key, value, floor):
-        peak = max(value, self._peaks[key] * 0.9, floor)
-        self._peaks[key] = peak
-        return peak
+        # RATE — actual pps against the target (full = hitting target)
+        rate = self.root.ids.cell_rate
+        rate.gauge_value = m["actual_pps"]
+        rate.gauge_max = max(1, m["pps"])
+        rate.big_text = str(int(m["actual_pps"]))
+        rate.caption_text = f"/ {m['pps']} target"
 
     # -- helpers ------------------------------------------------------------
     def _run(self, fn, msg):

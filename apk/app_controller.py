@@ -41,13 +41,15 @@ except Exception:  # off-device
         def warning(self, *a, **k): pass
     Logger = _L()
 
-from engine.contracts import Ownership, PhyMode
+from engine.contracts import Ownership, PhyMode, now_ms
 from engine.recon import TargetStore, ScanScanner, DEFAULT_CHANNELS
 from engine.attack import (
     AttackController, AttackPlan, ATTACK_MODES, from_recon, select_spoof,
-    build_spoof_set,
+    build_spoof_set, mode_label, mode_desc, mode_knobs,
 )
-from engine.mgmt_tx import MgmtTxController, MgmtCtx, MgmtTarget, DEFAULT_FREQ
+from engine.mgmt_tx import (
+    MgmtTxController, MgmtCtx, MgmtTarget, DEFAULT_FREQ, check_hexframe,
+)
 
 DEADNET_PREF = "DeadNet"
 
@@ -101,12 +103,20 @@ class AppController:
         self.spoof: List[MgmtTarget] = []          # resolved spoof set (the picks)
         self.attack_mode: int = 1                  # catalogue id (0 = NUKE)
         self.pps: int = 100
-        self.budget: int = 0                       # 0 = until stopped
+        self.budget: int = 0                       # 0 = until stopped (knob, no cap)
         self.patched: Optional[bool] = None        # last CapGate decision
         self.cap_reason: str = ""
+        # per-action knobs (fed into MgmtCtx; only the ones a mode uses matter)
+        self.knob_cli: str = ""                    # target client MAC (directed)
+        self.knob_fake: str = ""                   # spoofed source (floods)
+        self.knob_ssid: str = ""                   # SSID override
+        self.knob_hex: str = ""                    # custom frame (mode 12)
+        self.knob_payload: str = ""                # action-frame body (8-10)
+        self.knob_reason: int = 0                  # deauth/disassoc reason (0=default)
 
         self._attack_stop: Optional[threading.Event] = None
         self._attack_thread: Optional[threading.Thread] = None
+        self._attack_t0: int = 0                   # ns start, for actual-pps
         self._tick: Dict[str, int] = {"sent": 0, "ok": 0, "pps": 0}
         self._lock = threading.RLock()
 
@@ -228,10 +238,46 @@ class AppController:
     def set_mode(self, mode: int) -> None:
         self.attack_mode = int(mode)
         self.emit("attack_mode", mode=self.attack_mode,
-                  label=ATTACK_MODES.get(self.attack_mode, "NUKE" if self.attack_mode == NUKE_MODE else "?"))
+                  label=mode_label(self.attack_mode), desc=mode_desc(self.attack_mode),
+                  knobs=list(mode_knobs(self.attack_mode)))
 
     def set_pps(self, pps: int) -> None:
         self.pps = max(1, int(pps))
+
+    def set_budget(self, budget: int) -> None:
+        """Frames to send before auto-stopping; 0 = until STOP (operator knob)."""
+        try:
+            self.budget = max(0, int(budget))
+        except (TypeError, ValueError):
+            self.budget = 0
+
+    # -- per-action knobs (only the ones the active mode uses are applied) ---
+    def set_client(self, mac: str) -> None:
+        self.knob_cli = (mac or "").strip()
+
+    def set_fake(self, mac: str) -> None:
+        self.knob_fake = (mac or "").strip()
+
+    def set_ssid(self, ssid: str) -> None:
+        self.knob_ssid = ssid or ""
+
+    def set_custom_hex(self, hexframe: str) -> None:
+        self.knob_hex = (hexframe or "").strip()
+
+    def set_payload(self, payload: str) -> None:
+        self.knob_payload = (payload or "").strip()
+
+    def set_reason(self, reason) -> None:
+        try:
+            self.knob_reason = max(0, min(255, int(reason)))
+        except (TypeError, ValueError):
+            self.knob_reason = 0
+
+    def _mgmt_ctx(self) -> MgmtCtx:
+        """Build the MgmtCtx for a run from the current knobs."""
+        return MgmtCtx(assoc_ssid=self.knob_ssid, fake=self.knob_fake,
+                       cli=self.knob_cli, custom_hex=self.knob_hex,
+                       reason=self.knob_reason, payload=self.knob_payload)
 
     # =====================================================================
     # CAPABILITY GATE  (patched cfg80211 required for ATTACK)
@@ -293,6 +339,11 @@ class AppController:
             if not self.patched:
                 self.emit("error", msg=f"ATTACK blocked — {self.cap_reason or 'stock cfg80211'}")
                 return False
+            if self.attack_mode == 12:            # custom hex: validate before firing
+                ok, why = check_hexframe(self.knob_hex)
+                if not ok:
+                    self.emit("error", msg=f"custom frame rejected — {why}")
+                    return False
             spoof = self._spoof_for_run()
             if not spoof:
                 self.emit("error", msg="no targets selected (pick from RECON, or use NUKE)")
@@ -300,10 +351,11 @@ class AppController:
             plan = AttackPlan(
                 mode=self.attack_mode, spoof=spoof, iface=self.managed_iface,
                 pps=self.pps, budget=(self.budget if budget is None else int(budget)),
-                title=ATTACK_MODES.get(self.attack_mode, "nuke"),
+                title=mode_label(self.attack_mode),
                 nuke=(self.attack_mode == NUKE_MODE))
-            ctx = MgmtCtx()
+            ctx = self._mgmt_ctx()
             self._attack_stop = threading.Event()
+            self._attack_t0 = now_ms()
             self._tick = {"sent": 0, "ok": 0, "pps": plan.pps}
             self._attack_thread = threading.Thread(
                 target=self._attack_worker, args=(plan, ctx), name="attack", daemon=True)
@@ -331,11 +383,18 @@ class AppController:
 
     def stop_attack(self, back_to_recon: bool = True) -> None:
         """Halt the burst. By default resumes the RECON scan loop (if we were
-        reconning) so the operator can reselect. Nothing to un-seize."""
+        reconning) so the operator can reselect. Nothing to un-seize.
+
+        STOP is made instant: set the stop flag AND interrupt any in-flight send
+        so the worker can't be stuck waiting on a daemon reply."""
         with self._lock:
             if self._attack_stop is not None:
                 self._attack_stop.set()
             t = self._attack_thread
+        try:
+            self.tx.interrupt()
+        except Exception:  # noqa: BLE001
+            pass
         if t is not None and t.is_alive():
             t.join(timeout=3.0)
         with self._lock:
@@ -346,13 +405,20 @@ class AppController:
             self._emit_state()
 
     def state_metrics(self) -> dict:
-        """Live attack gauges (polled on a Clock tick)."""
+        """Live attack gauges (polled on a Clock tick). Two gauges:
+        ACCEPTED = accepted/sent, RATE = actual_pps/target_pps."""
         t = self._tick or {}
         sent = int(t.get("sent", 0))
         ok = int(t.get("ok", 0))
+        target_pps = int(t.get("pps", self.pps)) or 1
+        elapsed = (now_ms() - self._attack_t0) / 1000.0 if self._attack_t0 else 0.0
+        actual_pps = int(sent / elapsed) if elapsed > 0.2 else 0
         return {"sent": sent, "accepted": ok,
                 "miss": max(0, sent - ok),
-                "pps": int(t.get("pps", self.pps)),
+                "accept_pct": int(100 * ok / sent) if sent else 0,
+                "pps": target_pps,
+                "actual_pps": actual_pps,
+                "rate_pct": min(100, int(100 * actual_pps / target_pps)) if target_pps else 0,
                 "targets": len(self.spoof),
                 "attacking": self.is_attacking()}
 
@@ -367,6 +433,10 @@ class AppController:
             if self._attack_stop is not None:
                 self._attack_stop.set()
             t = self._attack_thread
+        try:
+            self.tx.interrupt()
+        except Exception:  # noqa: BLE001
+            pass
         if t is not None and t.is_alive():
             t.join(timeout=3.0)
         with self._lock:
@@ -414,9 +484,10 @@ if __name__ == "__main__":
         s = FakeScanScanner(store); scanners.append(s); return s
 
     class FakeTx:
-        def __init__(self): self.staged = False; self.closed = False
+        def __init__(self): self.staged = False; self.closed = False; self.interrupts = 0
         def stage(self): self.staged = True; return "/x/nl80211_inject.arm64"
         def send(self, iface, freq, hexframe, fast=False): return (True, False)
+        def interrupt(self): self.interrupts += 1
         def close(self): self.closed = True
 
     class FakeCap:
@@ -464,6 +535,7 @@ if __name__ == "__main__":
     # 7) RELEASE -> ANDROID/idle, scan stopped, tx closed
     assert ctl.release() is True
     assert ctl.state is AppState.ANDROID and tx.closed and resumed.stopped
+    assert tx.interrupts >= 1, "STOP/RELEASE must interrupt in-flight sends"
 
     kinds = [k for k, _ in events]
     for need in ("state", "recon", "selection", "attack_start", "attack_done", "released"):

