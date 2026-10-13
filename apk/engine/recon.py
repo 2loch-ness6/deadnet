@@ -61,11 +61,14 @@ DEFAULT_CHANNELS = CHANNELS_24 + CHANNELS_5
 # pure helpers (no I/O — unit-testable without a device)
 # ---------------------------------------------------------------------------
 def freq_to_channel(mhz: int) -> int:
-    """2.4GHz: 2412->1 .. 2472->13, 2484->14. 5GHz: (mhz-5000)/5. Unknown -> 0."""
+    """2.4GHz: 2412->1 .. 2472->13, 2484->14. 5GHz: (mhz-5000)/5.
+    6GHz (Wi-Fi 6E, 5955->1 .. 7115->233): (mhz-5950)/5. Unknown -> 0."""
     if mhz == 2484:
         return 14
     if 2412 <= mhz <= 2472:
         return 1 + (mhz - 2412) // 5
+    if 5925 <= mhz <= 7125:                 # 6 GHz band (own numbering)
+        return (mhz - 5950) // 5
     if mhz >= 5000:
         return (mhz - 5000) // 5
     return 0
@@ -173,6 +176,60 @@ def parse_80211_line(line: str, oui_classify: Optional[Callable[[str], str]] = N
             continue
         out.append(Target(mac=mac, kind=KIND_STA, channel=channel, freq=freq,
                           rssi=rssi, ap_bssid=bssid, vendor=oui_classify(mac),
+                          first_seen_ms=ts, last_seen_ms=ts))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Android-scan parser — `cmd wifi list-scan-results` (con_mode=0, no monitor)
+# ---------------------------------------------------------------------------
+# This device's qca driver can't make a concurrent monitor vif (-EINVAL) and its
+# only monitor is global con_mode=4, which is crash-prone at boot and conflicts
+# with the con_mode=0 mgmt-TX ATTACK path. So RECON reads the framework's own
+# scan instead. APs only (beacons/probe-resps); stations aren't visible without
+# monitor — the accepted trade for a robust, no-seize recon.
+_SCAN_HDR_RE = re.compile(r"^\s*BSSID\b", re.I)
+_RSSI_LEAD_RE = re.compile(r"^(-?\d+)")
+_MAC_FULL_RE = re.compile(rf"^{_MAC_RE}$")
+
+
+def parse_scan_results(text: str, oui_classify: Optional[Callable[[str], str]] = None,
+                       ts: Optional[int] = None) -> List[Target]:
+    """Parse `cmd wifi list-scan-results` output into AP Targets.
+
+    Row shape (OxygenOS 15):
+        BSSID              Frequency  RSSI              Age(sec)  SSID        Flags
+        0a:72:be:f4:51:63  5220       -32(0:-33/1:-35)  72.547    Work Net    [WPA2-...][ESS]
+
+    The first four columns never contain spaces; the SSID may ("Spectrum
+    Mobile") and Flags always begin at the first '[', so SSID is the text
+    between the age column and that bracket. Hidden SSIDs parse as "".
+    """
+    out: List[Target] = []
+    ts = now_ms() if ts is None else ts
+    oui_classify = oui_classify or (lambda _m: "")
+    for raw in (text or "").splitlines():
+        s = raw.strip()
+        if not s or _SCAN_HDR_RE.match(s):
+            continue
+        parts = s.split(None, 4)            # bssid, freq, rssi, age, rest(SSID+flags)
+        if len(parts) < 4:
+            continue
+        bssid = parts[0].lower()
+        if not _MAC_FULL_RE.match(bssid) or mac_skip(bssid):
+            continue
+        try:
+            freq = int(parts[1])
+        except ValueError:
+            continue
+        m = _RSSI_LEAD_RE.match(parts[2])
+        rssi = int(m.group(1)) if m else 0
+        rest = parts[4] if len(parts) >= 5 else ""
+        br = rest.find("[")
+        ssid = (rest[:br] if br >= 0 else rest).strip()
+        out.append(Target(mac=bssid, kind=KIND_AP, ssid=ssid,
+                          channel=freq_to_channel(freq), freq=freq, rssi=rssi,
+                          ap_bssid=bssid, vendor=oui_classify(bssid),
                           first_seen_ms=ts, last_seen_ms=ts))
     return out
 
@@ -345,6 +402,106 @@ class ReconScanner:
 
 
 # ---------------------------------------------------------------------------
+# ScanScanner — Android-scan recon loop (no monitor, no PHY seize)
+# ---------------------------------------------------------------------------
+def _default_scan_run(cmd: str, timeout: float = 12.0) -> str:
+    """Run a shell command as root through the shared persistent su shell,
+    returning merged stdout (empty on failure). Used for `cmd wifi …`."""
+    from engine import rootshell as _root
+    cp = _root.su_cp(cmd, timeout)
+    return getattr(cp, "stdout", "") or ""
+
+
+class ScanScanner:
+    """RECON without monitor: repeatedly trigger an Android Wi-Fi scan and fold
+    `cmd wifi list-scan-results` into the TargetStore. The radio stays with the
+    framework (con_mode=0, associated) — nothing is seized, so there is no WiFi
+    disruption and ATTACK's associated mgmt-TX path is left intact.
+
+    `run(cmd) -> stdout` is injectable so the loop is testable without a device.
+    """
+
+    def __init__(self, store: Optional[TargetStore] = None,
+                 on_target: Optional[Callable[[Target], None]] = None,
+                 interval_s: float = 4.0, settle_s: float = 2.5,
+                 run: Optional[Callable[[str], str]] = None,
+                 scan_cmd: str = "cmd wifi start-scan",
+                 results_cmd: str = "cmd wifi list-scan-results"):
+        self.store = store if store is not None else TargetStore()
+        self.on_target = on_target
+        self.interval_s = interval_s
+        self.settle_s = settle_s
+        self._run = run or _default_scan_run
+        self.scan_cmd = scan_cmd
+        self.results_cmd = results_cmd
+        self.scan_oui = _oui.classify if _oui is not None else (lambda _m: "")
+        self._thread: Optional[threading.Thread] = None
+        self._stop_evt = threading.Event()
+        self._running = False
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        with self._lock:
+            if self._running:
+                return
+            self._stop_evt.clear()
+            self._running = True
+            self._thread = threading.Thread(target=self._loop, name="recon-scan",
+                                            daemon=True)
+            self._thread.start()
+            Logger.info(f"{DEADNET_PREF}: recon (Android scan) started")
+
+    def scan_once(self) -> int:
+        """One scan cycle: trigger, read, fold into the store. Returns # parsed.
+        Also the loop body, so it is unit-testable on its own."""
+        try:
+            self._run(self.scan_cmd)
+        except Exception as exc:  # noqa: BLE001
+            Logger.error(f"{DEADNET_PREF}: start-scan failed: {exc}")
+        if self._stop_evt.wait(self.settle_s):
+            return 0
+        try:
+            text = self._run(self.results_cmd)
+        except Exception as exc:  # noqa: BLE001
+            Logger.error(f"{DEADNET_PREF}: list-scan-results failed: {exc}")
+            return 0
+        n = 0
+        for t in parse_scan_results(text, oui_classify=self.scan_oui):
+            try:
+                merged = self.store.upsert(t)
+            except Exception as exc:  # noqa: BLE001
+                Logger.error(f"{DEADNET_PREF}: recon upsert failed {t.mac}: {exc}")
+                continue
+            n += 1
+            if self.on_target is not None:
+                try:
+                    self.on_target(merged)
+                except Exception as exc:  # noqa: BLE001
+                    Logger.error(f"{DEADNET_PREF}: recon on_target error: {exc}")
+        return n
+
+    def _loop(self) -> None:
+        while not self._stop_evt.is_set():
+            try:
+                self.scan_once()
+            except Exception as exc:  # noqa: BLE001 - never raise out of the loop
+                Logger.error(f"{DEADNET_PREF}: recon scan loop error: {exc}")
+            if self._stop_evt.wait(self.interval_s):
+                break
+
+    def stop(self) -> None:
+        with self._lock:
+            if not self._running:
+                return
+            self._running = False
+            self._stop_evt.set()
+            t, self._thread = self._thread, None
+        if t is not None:
+            t.join(timeout=3.0)
+        Logger.info(f"{DEADNET_PREF}: recon (Android scan) stopped")
+
+
+# ---------------------------------------------------------------------------
 # Self-test (no device / no root)  cd apk && python3 engine/recon.py
 # ---------------------------------------------------------------------------
 _SAMPLE = [
@@ -420,6 +577,39 @@ def _self_test() -> None:
     assert sc.store.count() == 4, sc.store.count()
     assert len(seen) >= 4, len(seen)
     print("  [3] scanner: capture->parse->store, on_target fired  ok")
+
+    # scan parser: real OxygenOS `cmd wifi list-scan-results` output
+    scan_text = (
+        "    BSSID              Frequency      RSSI           Age(sec)     SSID                                 Flags\n"
+        "  0a:72:be:f4:51:63       5220    -32(0:-33/1:-35)    72.547    WorkforceTravel                   [WPA2-PSK-CCMP-128][RSN-PSK-CCMP-128][ESS]\n"
+        "  0a:72:be:f4:51:67       5220    -32(0:-33/1:-35)    72.545    Spectrum Mobile                   [WPA2-EAP/SHA256-CCMP-128][ESS][MFPR][PASSPOINT]\n"
+        "  0a:aa:be:ae:88:9b       5220    -72(0:-78/1:-73)    72.565    Not an FBI Van                    [WPA2-PSK-CCMP-128][ESS]\n"
+        "  ff:ff:ff:ff:ff:ff       2412    -50               1.0        BcastShouldDrop                   [ESS]\n"
+        "  88:33:74:04:f5:e0       2462    -72(0:-76/1:-75)    72.332                                      [WPA2-PSK-CCMP-128][ESS]\n")
+    aps = parse_scan_results(scan_text)
+    by = {t.mac: t for t in aps}
+    assert len(aps) == 4, (len(aps), [t.mac for t in aps])          # broadcast dropped
+    w = by["0a:72:be:f4:51:63"]
+    assert w.kind == KIND_AP and w.ssid == "WorkforceTravel" and w.freq == 5220
+    assert w.channel == 44 and w.rssi == -32, w                     # 5220 -> ch44, leading RSSI
+    assert by["0a:72:be:f4:51:67"].ssid == "Spectrum Mobile", "SSID with a space"
+    assert by["0a:aa:be:ae:88:9b"].ssid == "Not an FBI Van", "SSID with spaces"
+    assert by["88:33:74:04:f5:e0"].ssid == "", "hidden/blank SSID -> empty"
+    assert "ff:ff:ff:ff:ff:ff" not in by
+    print("  [4] scan parser: APs, spaced SSIDs, hidden SSID, bcast dropped  ok")
+
+    # ScanScanner: trigger->read->store loop with a fake `run`
+    calls = []
+    def fake_run(cmd, timeout=12.0):
+        calls.append(cmd)
+        return scan_text if "list-scan-results" in cmd else ""
+    seen2 = []
+    ss = ScanScanner(on_target=seen2.append, run=fake_run)
+    got = ss.scan_once()
+    assert got == 4 and ss.store.count() == 4, (got, ss.store.count())
+    assert calls[0] == "cmd wifi start-scan" and "list-scan-results" in calls[1]
+    assert len(seen2) == 4
+    print("  [5] scan scanner: start-scan + list-scan-results -> store  ok")
 
     print("RECON PASS")
 

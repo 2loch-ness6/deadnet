@@ -118,9 +118,30 @@ class RadioController:
     # -- discovery ----------------------------------------------------------
     def phy(self) -> str:
         if self._phy is None:
-            cp = _su(f"cat /sys/class/net/{self.managed_iface}/phy80211/name 2>/dev/null")
-            self._phy = phy_for_iface(self.managed_iface, cp.stdout) or "phy0"
+            self._phy = self._discover_phy()
         return self._phy
+
+    def _discover_phy(self) -> str:
+        """Resolve the wiphy name for our radio. Try, in order: the managed vif's
+        sysfs phy link, the monitor vif's (it may be the only one up in con_mode=4),
+        `iw dev` (the phy#N heading), and finally the sole entry in
+        /sys/class/ieee80211/. Never silently assume 'phy0' — that masked a real
+        bug on this device (the radio is phy6)."""
+        for iface in (self.managed_iface, self.mon_iface):
+            name = phy_for_iface(iface, _su(
+                f"cat /sys/class/net/{iface}/phy80211/name 2>/dev/null").stdout)
+            if name:
+                return name
+        # `iw dev` groups vifs under a `phy#N` heading
+        m = re.search(r"phy#(\d+)", _su("iw dev").stdout or "")
+        if m:
+            return f"phy{m.group(1)}"
+        # last resort: the single registered wiphy
+        for line in (_su("ls /sys/class/ieee80211/ 2>/dev/null").stdout or "").split():
+            if line.startswith("phy"):
+                return line
+        Logger.error(f"{DEADNET_PREF}: could not resolve wiphy name; defaulting phy0")
+        return "phy0"
 
     def is_associated(self) -> Optional[str]:
         """Return the associated BSSID (lowercase) or None."""

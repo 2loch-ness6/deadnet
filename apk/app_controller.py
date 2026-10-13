@@ -42,7 +42,7 @@ except Exception:  # off-device
     Logger = _L()
 
 from engine.contracts import Ownership, PhyMode
-from engine.recon import TargetStore, ReconScanner, DEFAULT_CHANNELS
+from engine.recon import TargetStore, ScanScanner, DEFAULT_CHANNELS
 from engine.attack import (
     AttackController, AttackPlan, ATTACK_MODES, from_recon, select_spoof,
     build_spoof_set,
@@ -86,9 +86,14 @@ class AppController:
         self.capgate = capgate
         self.attack = attack if attack is not None else AttackController(
             self.tx.send, ensure_attack=self._ensure_attack_mode)
-        # recon_factory(mon_iface, store, on_target, set_channel) -> ReconScanner
+        # recon_factory(store, on_target) -> a scanner with start()/stop().
+        # RECON is the framework's own Wi-Fi scan (con_mode=0, no monitor vif,
+        # no PHY seize) — this device can't do a concurrent monitor and its
+        # global con_mode=4 monitor is crash-prone and conflicts with the
+        # associated mgmt-TX ATTACK path. See engine/recon.ScanScanner.
         self._recon_factory = recon_factory or self._default_recon_factory
-        self.recon: Optional[ReconScanner] = None
+        self.recon = None
+        self._recon_on: bool = False
 
         # --- operator state ---
         self.recon_channel: int = 6
@@ -106,9 +111,8 @@ class AppController:
         self._lock = threading.RLock()
 
     # -- recon scanner builder --------------------------------------------
-    def _default_recon_factory(self, mon_iface, store, on_target, set_channel):
-        return ReconScanner(mon_iface=mon_iface, store=store, on_target=on_target,
-                            set_channel=set_channel, channels=list(DEFAULT_CHANNELS))
+    def _default_recon_factory(self, store, on_target):
+        return ScanScanner(store=store, on_target=on_target)
 
     # -- event helper ------------------------------------------------------
     def emit(self, kind: str, **data) -> None:
@@ -120,19 +124,24 @@ class AppController:
     # -- state view --------------------------------------------------------
     @property
     def state(self) -> AppState:
-        if self.phyguard.ownership != Ownership.APP:
-            return AppState.ANDROID
-        return AppState.ATTACK if self.phyguard.mode == PhyMode.ATTACK else AppState.RECON
+        # No PHY seize in this device's model: RECON = the scan loop is running,
+        # ATTACK = a mgmt-TX burst is in flight, else ANDROID (idle).
+        if self.is_attacking():
+            return AppState.ATTACK
+        if self._recon_on:
+            return AppState.RECON
+        return AppState.ANDROID
 
     def is_attacking(self) -> bool:
         t = self._attack_thread
         return t is not None and t.is_alive()
 
     def capabilities(self) -> dict:
+        st = self.state
         return {
-            "state": self.state.value,
-            "ownership": self.phyguard.ownership.value,
-            "mode": self.phyguard.mode.value if self.phyguard.mode else "",
+            "state": st.value,
+            "ownership": "app" if st is not AppState.ANDROID else "android",
+            "mode": st.value if st is not AppState.ANDROID else "",
             "patched": self.patched,
             "cap_reason": self.cap_reason,
             "targets": self.store.count(),
@@ -149,26 +158,21 @@ class AppController:
     # OWN / RECON  (ANDROID -> APP/RECON: seize monitor + start discovery)
     # =====================================================================
     def own_recon(self, channel: Optional[int] = None) -> bool:
-        """Seize the PHY into RECON and start monitor-mode target discovery.
-        From ATTACK this just switches back to RECON. Android is guarded out."""
+        """Enter RECON: start the Android-scan loop. No PHY seize — the radio
+        stays with the framework (con_mode=0, associated), which is what keeps
+        the mgmt-TX ATTACK path usable. `channel` is accepted for API symmetry
+        but ignored (the scan sweeps every channel)."""
         with self._lock:
-            ch = self.recon_channel if channel is None else int(channel)
-            self.recon_channel = ch
-            if not self.phyguard.own(ch):
-                self.emit("error", msg="could not seize PHY for RECON")
-                self._emit_state()
-                return False
+            self._recon_on = True
             self._start_recon()
-            self.emit("recon", channel=ch)
+            self.emit("recon", channel=0)
             self._emit_state()
             return True
 
     def _start_recon(self) -> None:
         if self.recon is not None:
             return
-        self.recon = self._recon_factory(
-            self.mon_iface, self.store, self._on_target,
-            getattr(self.phyguard.radio, "set_channel", None))
+        self.recon = self._recon_factory(self.store, self._on_target)
         try:
             self.recon.start()
         except Exception as exc:  # noqa: BLE001
@@ -257,9 +261,11 @@ class AppController:
     # ATTACK  (APP/RECON -> APP/ATTACK: scheduled mgmt-TX at the selection)
     # =====================================================================
     def _ensure_attack_mode(self) -> bool:
-        """Stop RECON capture (frees the RF chain) then switch the PHY to ATTACK."""
+        """Prepare for a mgmt-TX burst. On this device ATTACK injects on the
+        associated wlan0 (no seize), so there is nothing to seize — we only stop
+        the scan loop so its start-scans don't contend with TX timing."""
         self._stop_recon()
-        return self.phyguard.to_attack()
+        return True
 
     def _spoof_for_run(self) -> List[MgmtTarget]:
         if self.attack_mode == NUKE_MODE:
@@ -281,9 +287,6 @@ class AppController:
         with self._lock:
             if self.is_attacking():
                 self.emit("error", msg="already attacking")
-                return False
-            if self.phyguard.ownership != Ownership.APP:
-                self.emit("error", msg="own the PHY (RECON) before attacking")
                 return False
             if self.patched is None:
                 self.check_capability()
@@ -327,8 +330,8 @@ class AppController:
         self._emit_state()
 
     def stop_attack(self, back_to_recon: bool = True) -> None:
-        """Halt the burst. By default returns the PHY to RECON (re-adds mon0 and
-        restarts discovery) so the operator can reselect."""
+        """Halt the burst. By default resumes the RECON scan loop (if we were
+        reconning) so the operator can reselect. Nothing to un-seize."""
         with self._lock:
             if self._attack_stop is not None:
                 self._attack_stop.set()
@@ -338,9 +341,8 @@ class AppController:
         with self._lock:
             self._attack_thread = None
             self._attack_stop = None
-            if back_to_recon and self.phyguard.ownership == Ownership.APP:
-                if self.phyguard.to_recon():
-                    self._start_recon()
+            if back_to_recon and self._recon_on:
+                self._start_recon()
             self._emit_state()
 
     def state_metrics(self) -> dict:
@@ -358,8 +360,9 @@ class AppController:
     # RELEASE / SHUTDOWN
     # =====================================================================
     def release(self) -> bool:
-        """Give the PHY back to Android and restore the baseline. Safe to re-call.
-        Stops any attack burst and the RECON capture first."""
+        """Return to ANDROID/idle: stop any attack burst and the RECON scan loop,
+        close the injector. Safe to re-call. Nothing was seized, so there is no
+        baseline to restore — the framework kept the radio throughout."""
         with self._lock:
             if self._attack_stop is not None:
                 self._attack_stop.set()
@@ -369,20 +372,15 @@ class AppController:
         with self._lock:
             self._attack_thread = None
             self._attack_stop = None
+            self._recon_on = False
             self._stop_recon()
             try:
                 self.tx.close()
             except Exception:  # noqa: BLE001
                 pass
-            ok = True
-            try:
-                ok = self.phyguard.release()
-            except Exception as exc:  # noqa: BLE001
-                Logger.error(f"{DEADNET_PREF}: release failed: {exc}")
-                ok = False
             self.emit("released")
             self._emit_state()
-            return bool(ok)
+            return True
 
     def shutdown(self) -> None:
         self.release()
@@ -397,32 +395,12 @@ if __name__ == "__main__":
 
     events: List[tuple] = []
 
-    class FakeRadio:
-        def set_channel(self, ch): return True
-
-    class FakePhyGuard:
-        def __init__(self):
-            self.ownership = Ownership.ANDROID
-            self.mode = None
-            self.radio = FakeRadio()
-            self.log = []
-        def own(self, ch=6):
-            self.ownership = Ownership.APP; self.mode = PhyMode.RECON
-            self.log.append(("own", ch)); return True
-        def to_attack(self):
-            self.mode = PhyMode.ATTACK; self.log.append(("to_attack",)); return True
-        def to_recon(self, ch=None):
-            self.mode = PhyMode.RECON; self.log.append(("to_recon", ch)); return True
-        def release(self):
-            self.ownership = Ownership.ANDROID; self.mode = None
-            self.log.append(("release",)); return True
-
-    class FakeScanner:
+    # RECON scanner fake (Android-scan model: start() seeds APs, no seize).
+    class FakeScanScanner:
         def __init__(self, store):
             self.store = store; self.started = False; self.stopped = False
         def start(self):
             self.started = True
-            # seed a couple of targets as if captured off the air
             from engine.recon import Target, now_ms
             self.store.upsert(Target(mac="aa:bb:cc:00:11:22", kind="ap", ssid="HomeNet",
                                      channel=6, freq=2437, rssi=-40, last_seen_ms=now_ms()))
@@ -431,9 +409,9 @@ if __name__ == "__main__":
         def stop(self):
             self.stopped = True
 
-    scanners: List[FakeScanner] = []
-    def fake_recon_factory(mon, store, on_target, set_channel):
-        s = FakeScanner(store); scanners.append(s); return s
+    scanners: List[FakeScanScanner] = []
+    def fake_recon_factory(store, on_target):
+        s = FakeScanScanner(store); scanners.append(s); return s
 
     class FakeTx:
         def __init__(self): self.staged = False; self.closed = False
@@ -448,49 +426,46 @@ if __name__ == "__main__":
                                          reason=("patched" if self._p else "stock"))
 
     tx = FakeTx()
-    pg = FakePhyGuard()
-    ctl = AppController(tempfile.mkdtemp(), phyguard=pg, tx=tx, capgate=FakeCap(True),
+    ctl = AppController(tempfile.mkdtemp(), tx=tx, capgate=FakeCap(True),
                         recon_factory=fake_recon_factory,
                         on_event=lambda k, d: events.append((k, d)))
 
-    # 1) ANDROID baseline
+    # 1) ANDROID baseline (idle, radio with the framework)
     assert ctl.state is AppState.ANDROID
-    # 2) OWN -> RECON, scanner started, targets appear
-    assert ctl.own_recon(6) is True
+    # 2) RECON: scan loop starts (no seize), APs appear in the store
+    assert ctl.own_recon() is True
     assert ctl.state is AppState.RECON and scanners[0].started
     assert ctl.store.count("ap") == 2, ctl.store.count("ap")
-    assert pg.log[0] == ("own", 6)
 
     # 3) SELECT: index + glob against the recon inventory
     assert ctl.set_selection("all") == 2
     assert ctl.set_selection("SHome*") == 1 and ctl.spoof[0].ssid == "HomeNet"
     assert ctl.set_selection("1,2") == 2
 
-    # 4) ATTACK gated by CapGate; patched -> runs, switches to ATTACK, stops recon
+    # 4) ATTACK gated by CapGate; patched -> runs, stops the scan loop (no seize)
     ctl.set_mode(1); ctl.set_pps(200); ctl.budget = 10
     assert ctl.start_attack() is True
     ctl._attack_thread.join(timeout=3.0)
-    assert ("to_attack",) in pg.log, pg.log
-    assert scanners[0].stopped, "recon capture must stop before an attack burst"
+    assert scanners[0].stopped, "scan loop must stop before an attack burst"
     m = ctl.state_metrics()
     assert m["sent"] == 10 and m["accepted"] == 10, m
 
-    # 5) stop_attack -> back to RECON (mon re-added, fresh scanner started)
+    # 5) stop_attack -> RECON scan loop resumes (fresh scanner started)
     ctl.stop_attack(back_to_recon=True)
-    assert pg.mode == PhyMode.RECON and scanners[-1].started
+    resumed = scanners[-1]
+    assert ctl.state is AppState.RECON and resumed.started
 
-    # 6) CapGate refusal on stock cfg80211 blocks ATTACK
-    ctl2 = AppController(tempfile.mkdtemp(), phyguard=FakePhyGuard(), tx=FakeTx(),
-                         capgate=FakeCap(False), recon_factory=fake_recon_factory,
-                         on_event=lambda k, d: None)
-    ctl2.own_recon(6); ctl2.set_selection("all")
+    # 6) CapGate refusal on stock cfg80211 blocks ATTACK (no prior seize needed)
+    ctl2 = AppController(tempfile.mkdtemp(), tx=FakeTx(), capgate=FakeCap(False),
+                         recon_factory=fake_recon_factory, on_event=lambda k, d: None)
+    ctl2.own_recon(); ctl2.set_selection("all")
     assert ctl2.start_attack() is False and ctl2.patched is False
 
-    # 7) RELEASE -> ANDROID, tx closed
+    # 7) RELEASE -> ANDROID/idle, scan stopped, tx closed
     assert ctl.release() is True
-    assert ctl.state is AppState.ANDROID and tx.closed
+    assert ctl.state is AppState.ANDROID and tx.closed and resumed.stopped
 
     kinds = [k for k, _ in events]
     for need in ("state", "recon", "selection", "attack_start", "attack_done", "released"):
         assert need in kinds, (need, kinds)
-    print("AppController (v3 M4 state machine) PASS")
+    print("AppController (v3 scan-recon state machine) PASS")
