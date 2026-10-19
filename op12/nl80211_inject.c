@@ -28,6 +28,32 @@
 // Blank lines are ignored; EOF exits 0. Diagnostics go to stderr (stdout is pure
 // protocol). One malformed line never kills the daemon.
 //
+// ROC (remain-on-channel), env-gated so default behaviour is unchanged:
+//   ROC=1          park the radio on the target freq (NL80211_CMD_REMAIN_ON_CHANNEL)
+//                  before transmitting. This is REQUIRED for an UNASSOCIATED
+//                  interface to actually radiate: without a channel context the
+//                  firmware fakes acceptance (a canned, repeating cookie + fake
+//                  ACK) and drops the frame. With ROC the cookie is a real,
+//                  sequential TX handle and the frame hits the air.
+//   ROC_MS=<ms>    ROC duration per arm (100..10000, default 5000). In --stdio the
+//                  ROC is re-armed automatically before it lapses and on any
+//                  channel change, and cancelled on clean exit.
+// OFFCHANNEL_TX_OK is set automatically whenever ROC is active (the TX is
+// off-channel relative to the — absent — operating channel).
+//
+// KIWI/WCN7850 FINDING (2026-10-16, A/B-measured against an owned ESP32 AP +
+// associated victim): this driver implements remain-on-channel via its SCAN
+// engine. cfg80211 returns a ROC cookie synchronously (looks like success), but
+// the firmware then rejects the underlying off-channel scan —
+//   kiwi_v2: [E:OSIF] wlan_is_scan_allowed: Simultaneous scan disabled, reject scan
+// — so the radio never reliably parks. A 12s ROC deauth flood from an
+// UNASSOCIATED phone moved the victim's ping loss only 0-5%, vs 77% from the
+// SAME frame when the phone was ASSOCIATED (real channel context). `iw set
+// channel` on the managed iface likewise returns EBUSY. Conclusion: on this
+// chip, reliable mgmt-TX needs channel context via ASSOCIATION; ROC here is a
+// no-op for injection. The code is retained (gated, harmless) for other chips /
+// future firmware where scan-based ROC isn't gated this way.
+//
 // Default frame = vendor-specific action (category 0x7f) with a locally-administered,
 // spoofed source and broadcast DA, carrying the ASCII tag "INJECTTEST" so you can grep
 // for it in a capture. Harmless: no peer state machine reacts to a vendor-specific action.
@@ -55,6 +81,16 @@
 static int nl_fd = -1;
 static unsigned int nl_seq = 0;
 static int mlme_mcast_grp = -1;   // id of nl80211 "mlme" multicast group (FRAME_TX_STATUS)
+
+// Remain-on-channel (ROC) config, set from env in main() (ROC=1, ROC_MS=<ms>).
+// ROC parks the radio on the target channel so an UNASSOCIATED interface gains a
+// channel context; without it the firmware fakes acceptance (canned cookie) and
+// the frame never radiates. See do_roc().
+static int g_roc_mode = 0;
+static unsigned g_roc_ms = 2000;  // duration per ROC arm (ms); WCN7850 caps this at 2000.
+                                  // A new ROC cannot overlap an active one (EBUSY), so we
+                                  // re-arm only after the current window lapses.
+#define ROC_MS_MAX 2000u
 
 // --- tiny netlink attribute helpers (all lengths NLA/NLMSG aligned) ---
 // Returns 0 on success, -1 if the attribute would overflow the buffer.
@@ -298,10 +334,11 @@ static struct txres do_tx(int fam, unsigned ifindex, unsigned freq,
         r.kind = TX_LOCALERR; r.err = E2BIG;
         return r;
     }
-    // Only request off-channel TX if asked (env OFFCHAN=1). On the operating
-    // channel it's unnecessary and the driver may reject it (expects a ROC).
+    // Request off-channel TX if asked (env OFFCHAN=1) or whenever ROC is active:
+    // with a live remain-on-channel, an unassociated iface has no "operating"
+    // channel, so the driver treats the TX as off-channel and expects this flag.
     const char *offchan = getenv("OFFCHAN");
-    if (offchan && atoi(offchan)) {
+    if ((offchan && atoi(offchan)) || g_roc_mode) {
         if (add_attr(nlh, BUFSZ, NL80211_ATTR_OFFCHANNEL_TX_OK, NULL, 0) < 0) {
             r.kind = TX_LOCALERR; r.err = E2BIG;
             return r;
@@ -377,6 +414,107 @@ static struct txres do_tx(int fam, unsigned ifindex, unsigned freq,
     }
 }
 
+static long long now_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+// Drain any queued multicast events (FRAME_TX_STATUS, ROC ready/expired) and
+// stale replies so the next synchronous reply read is unambiguous. Non-blocking.
+static void nl_drain(void) {
+    char tmp[BUFSZ];
+    while (recv(nl_fd, tmp, sizeof(tmp), MSG_DONTWAIT) >= 0)
+        ;   // discard until EAGAIN/EWOULDBLOCK
+}
+
+// Park the radio on `freq` for duration_ms via NL80211_CMD_REMAIN_ON_CHANNEL.
+// This gives an UNASSOCIATED station a channel context, which is the missing
+// ingredient for mgmt-TX to actually radiate off the operating channel. The
+// socket is also joined to the mlme mcast group, so command replies are
+// demultiplexed from async events by matching nlmsg_seq. Returns 0 (fills
+// *cookie_out when present) on success, -1 on error (errno set).
+static int do_roc(int fam, unsigned ifindex, unsigned freq, unsigned duration_ms,
+                  unsigned long long *cookie_out) {
+    nl_drain();
+    char buf[BUFSZ];
+    memset(buf, 0, sizeof(buf));
+    struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+    nlh->nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN);
+    nlh->nlmsg_type = fam;
+    nlh->nlmsg_flags = NLM_F_REQUEST;   // no ACK: exactly one reply (cookie) or NLMSG_ERROR
+    unsigned myseq = ++nl_seq;
+    nlh->nlmsg_seq = myseq;
+    nlh->nlmsg_pid = (unsigned)getpid();
+    struct genlmsghdr *gnlh = (struct genlmsghdr *)NLMSG_DATA(nlh);
+    gnlh->cmd = NL80211_CMD_REMAIN_ON_CHANNEL;
+    gnlh->version = 0;
+    if (add_attr(nlh, BUFSZ, NL80211_ATTR_IFINDEX, &ifindex, sizeof(ifindex)) < 0 ||
+        add_attr(nlh, BUFSZ, NL80211_ATTR_WIPHY_FREQ, &freq, sizeof(freq)) < 0 ||
+        add_attr(nlh, BUFSZ, NL80211_ATTR_DURATION, &duration_ms, sizeof(duration_ms)) < 0) {
+        errno = E2BIG;
+        return -1;
+    }
+    if (send(nl_fd, nlh, nlh->nlmsg_len, 0) != (ssize_t)nlh->nlmsg_len)
+        return -1;
+
+    // Bounded, time-limited read for our reply; skip async events (other seq).
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(nl_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    int rc = -1;
+    for (int i = 0; i < 8192; i++) {
+        ssize_t rlen = xrecv(buf, sizeof(buf));
+        if (rlen < 0) { rc = -1; break; }        // timeout/error (errno set)
+        struct nlmsghdr *rh = (struct nlmsghdr *)buf;
+        if (!hdr_ok(rh, rlen)) continue;
+        if (rh->nlmsg_seq != myseq) continue;    // async mcast event or other reply
+        if (rh->nlmsg_type == NLMSG_ERROR) {
+            if (rlen < (ssize_t)NLMSG_LENGTH(sizeof(struct nlmsgerr))) { errno = EBADMSG; rc = -1; break; }
+            struct nlmsgerr *e = (struct nlmsgerr *)NLMSG_DATA(rh);
+            if (e->error == 0) { rc = 0; break; } // bare ACK, no cookie
+            errno = -e->error; rc = -1; break;
+        }
+        if (cookie_out && rh->nlmsg_len >= NLMSG_LENGTH(GENL_HDRLEN)) {
+            struct nlattr *na = (struct nlattr *)((char *)NLMSG_DATA(rh) + GENL_HDRLEN);
+            int alen = (int)rh->nlmsg_len - (int)NLMSG_LENGTH(GENL_HDRLEN);
+            while (nla_ok(na, alen)) {
+                if (na->nla_type == NL80211_ATTR_COOKIE && na->nla_len == NLA_HDRLEN + 8)
+                    memcpy(cookie_out, (char *)na + NLA_HDRLEN, 8);
+                int step = NLA_ALIGN(na->nla_len);
+                alen -= step;
+                na = (struct nlattr *)((char *)na + step);
+            }
+        }
+        rc = 0;
+        break;
+    }
+    // Restore blocking behaviour for the proven do_tx fast path.
+    struct timeval z = { .tv_sec = 0, .tv_usec = 0 };
+    setsockopt(nl_fd, SOL_SOCKET, SO_RCVTIMEO, &z, sizeof(z));
+    return rc;
+}
+
+// Best-effort release of an active ROC (NL80211_CMD_CANCEL_REMAIN_ON_CHANNEL).
+// Does not wait for a reply — the radio also frees the channel when the ROC
+// duration lapses, so this just returns it sooner on clean exit.
+static void do_cancel_roc(int fam, unsigned ifindex, unsigned long long cookie) {
+    char buf[BUFSZ];
+    memset(buf, 0, sizeof(buf));
+    struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+    nlh->nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN);
+    nlh->nlmsg_type = fam;
+    nlh->nlmsg_flags = NLM_F_REQUEST;
+    nlh->nlmsg_seq = ++nl_seq;
+    nlh->nlmsg_pid = (unsigned)getpid();
+    struct genlmsghdr *gnlh = (struct genlmsghdr *)NLMSG_DATA(nlh);
+    gnlh->cmd = NL80211_CMD_CANCEL_REMAIN_ON_CHANNEL;
+    gnlh->version = 0;
+    if (add_attr(nlh, BUFSZ, NL80211_ATTR_IFINDEX, &ifindex, sizeof(ifindex)) < 0 ||
+        add_attr(nlh, BUFSZ, NL80211_ATTR_COOKIE, &cookie, sizeof(cookie)) < 0)
+        return;
+    (void)send(nl_fd, nlh, nlh->nlmsg_len, 0);
+}
+
 static unsigned parse_freq(const char *s, int *ok) {
     char *ep = NULL;
     // NOTE: 0 passes through (kernel answers EINVAL — the surface matrix
@@ -395,6 +533,11 @@ static int stdio_loop(const char *ifname, int dflt_fast, long wait_secs) {
     if (nl_setup(ifname, &ifindex, &fam, 0) < 0)
         return 1;
     setvbuf(stdout, NULL, _IONBF, 0);
+    // ROC state: keep the radio parked on the freq we're injecting on, re-arming
+    // before the current window lapses. On a channel change we re-arm immediately.
+    unsigned roc_freq = 0;
+    long long roc_deadline_ms = 0;
+    unsigned long long roc_cookie = 0;
     char *line = NULL;
     size_t cap = 0;
     ssize_t n;
@@ -430,6 +573,33 @@ static int stdio_loop(const char *ifname, int dflt_fast, long wait_secs) {
             flen = hex2bin(hex, frame, (int)sizeof(frame));
             if (flen < 0) { printf("ERR bad hexframe\n"); continue; }
         }
+        // Ensure a live remain-on-channel on this freq before transmitting, so an
+        // unassociated interface actually radiates. A ROC cannot overlap an active
+        // one (EBUSY), so we re-arm only once the current window has lapsed (or on
+        // a channel change). EBUSY means the kernel's ROC outlives our clock — still
+        // covered, just check again shortly. A genuine failure is throttled so a
+        // persistent error can never storm the log or spin the loop.
+        if (g_roc_mode) {
+            long long t = now_ms();
+            if ((unsigned)f != roc_freq || t >= roc_deadline_ms) {
+                unsigned long long c = roc_cookie;
+                int rr = do_roc(fam, ifindex, (unsigned)f, g_roc_ms, &c);
+                if (rr == 0) {
+                    roc_freq = (unsigned)f;
+                    roc_cookie = c;
+                    roc_deadline_ms = t + (long long)g_roc_ms;
+                    usleep(15000);   // let the radio settle on-channel after a (re)arm
+                } else if (errno == EBUSY) {
+                    roc_freq = (unsigned)f;
+                    roc_deadline_ms = t + 150;   // still on-channel; recheck soon
+                } else {
+                    roc_freq = (unsigned)f;
+                    roc_deadline_ms = t + 500;   // throttle a real failure
+                    fprintf(stderr, "roc arm failed on %u MHz: %s\n",
+                            (unsigned)f, strerror(errno));
+                }
+            }
+        }
         struct txres r = do_tx(fam, ifindex, (unsigned)f, frame, flen, ffast, wait_secs);
         switch (r.kind) {
         case TX_ACCEPTED_ACK:
@@ -455,6 +625,8 @@ static int stdio_loop(const char *ifname, int dflt_fast, long wait_secs) {
         }
     }
     free(line);
+    if (g_roc_mode && roc_freq)
+        do_cancel_roc(fam, ifindex, roc_cookie);   // release the channel on clean exit
     close(nl_fd);
     nl_fd = -1;
     return 0;
@@ -491,6 +663,15 @@ int main(int argc, char **argv) {
     }
     const char *ifname = argc > 1 ? argv[1] : "wlan0";
 
+    // ROC config (shared by both --stdio and single-shot paths).
+    const char *roc_env = getenv("ROC");
+    g_roc_mode = (roc_env && atoi(roc_env)) ? 1 : 0;
+    const char *roc_ms_env = getenv("ROC_MS");
+    if (roc_ms_env) {
+        int v = atoi(roc_ms_env);
+        if (v >= 100 && v <= (int)ROC_MS_MAX) g_roc_ms = (unsigned)v;
+    }
+
     if (stdio)
         return stdio_loop(ifname, fast, wait_secs);
 
@@ -521,6 +702,17 @@ int main(int argc, char **argv) {
     if (nl_setup(ifname, &ifindex, &fam, 1) < 0)
         return (nl_fd == -1 && ifindex == 0) ? 2 : 1;
     printf(", freq = %u, frame_len = %d\n", freq, flen);
+
+    unsigned long long roc_cookie = 0;
+    if (g_roc_mode) {
+        if (do_roc(fam, ifindex, freq, g_roc_ms, &roc_cookie) < 0) {
+            fprintf(stderr, "ROC arm failed on %u MHz: %s\n", freq, strerror(errno));
+        } else {
+            printf("ROC: parked on %u MHz for %u ms (cookie=0x%llx)\n",
+                   freq, g_roc_ms, roc_cookie);
+            usleep(15000);   // settle on-channel before the TX
+        }
+    }
 
     struct txres r = do_tx(fam, ifindex, freq, frame, flen, fast, wait_secs);
     int rc = 0;
@@ -556,6 +748,8 @@ int main(int argc, char **argv) {
             printf("TXSTATUS: none within %lds (no status event delivered)\n", wait_secs);
         }
     }
+    if (g_roc_mode && roc_cookie)
+        do_cancel_roc(fam, ifindex, roc_cookie);
     close(nl_fd);
     return rc;
 }

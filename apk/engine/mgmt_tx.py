@@ -99,6 +99,24 @@ def fr(fc: str, da: str, sa: str, bssid: str, body: str) -> str:
     return "%s0000%s%s%s0000%s" % (fc, da, sa, bssid, body)
 
 
+def _freq_to_chan(mhz) -> int:
+    """MHz -> 802.11 channel (for a beacon's DS Parameter Set IE). 0 if unknown.
+    Mirrors recon.freq_to_channel (kept local to avoid an import cycle)."""
+    try:
+        mhz = int(mhz)
+    except (TypeError, ValueError):
+        return 0
+    if mhz == 2484:
+        return 14
+    if 2412 <= mhz <= 2472:
+        return 1 + (mhz - 2412) // 5
+    if 5925 <= mhz <= 7125:
+        return (mhz - 5950) // 5
+    if mhz >= 5000:
+        return (mhz - 5000) // 5
+    return 0
+
+
 def ssid_ies(ssid: str) -> str:
     b = (ssid or "").encode("utf-8", "replace")
     return "00%02x%s010882848b960c121824" % (len(b), binascii.hexlify(b).decode())
@@ -243,11 +261,14 @@ def build_frame(mode: int, tgt: MgmtTarget, ctx: MgmtCtx) -> Tuple[str, str]:
         return (("non-public action cat=00 -> %s" % m), fr("d000", m, m, m, body))
     if mode == 11:
         s = eff_ssid(tgt.ssid, ctx.assoc_ssid)
-        body = "000000000000000064000401" + ssid_ies(s)
+        # timestamp(8) | beacon interval 100 TU | capability ESS | SSID+rates | DS(chan)
+        ch = _freq_to_chan(tgt.freq)
+        ds = ("0301%02x" % ch) if 0 < ch < 256 else ""
+        body = "0000000000000000" + "6400" + "0100" + ssid_ies(s) + ds
         if t == "ap":
-            return (('beacon spoof (BSSID=SA=%s SSID="%s")' % (m, s)),
+            return (('beacon (BSSID=%s SSID="%s" ch%d)' % (m, s, ch)),
                     fr("8000", BC, m, m, body))
-        return (("probe-resp spoof -> bcast BSSID=%s" % ap),
+        return (("probe-resp -> bcast BSSID=%s" % ap),
                 fr("5000", BC, m, ap, body))
     if mode == 12:
         return ("custom frame", re.sub(r"[\s:]", "", ctx.custom_hex or "").lower())
@@ -386,6 +407,8 @@ class MgmtTxController:
         self._popen = popen
         self.daemons: Dict[str, DaemonInjector] = {}
         self.injector_path: Optional[str] = None
+        self.sap = None          # optional SapController for unassociated SAP injection
+        self.sap_iface: Optional[str] = None
 
     def staged_src(self) -> str:
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -405,8 +428,33 @@ class MgmtTxController:
         self.injector_path = dst
         return dst
 
+    def enable_sap(self, channel: int, iface: Optional[str] = None) -> bool:
+        """Bring up a SoftAP channel-context for unassociated injection."""
+        from engine.sap import SapController
+        if self.sap is None:
+            self.sap = SapController(iface=iface or self.sap_iface or "wlan0",
+                                     appdir=self.appdir)
+        self.sap_iface = self.sap.iface
+        return self.sap.start(channel)
+
+    def disable_sap(self) -> None:
+        if self.sap is not None:
+            try:
+                self.sap.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self.sap = None
+
+    def sap_active(self) -> bool:
+        return self.sap is not None and self.sap.is_active()
+
     def send(self, iface: str, freq: int, hexframe: str,
              fast: bool = False) -> Tuple[bool, bool]:
+        if self.sap_active():
+            try:
+                return self.sap.send(hexframe)  # type: ignore[union-attr]
+            except Exception:  # noqa: BLE001
+                pass
         """Transmit one frame. Prefers the daemon; falls back to one-shot."""
         if self.injector_path and not self._popen:
             d = self.daemons.get(iface)
@@ -441,6 +489,7 @@ class MgmtTxController:
                 pass
 
     def close(self):
+        self.disable_sap()
         for d in list(self.daemons.values()):
             try:
                 d.close()

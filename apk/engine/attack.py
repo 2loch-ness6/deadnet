@@ -96,8 +96,10 @@ ATTACK_CATALOG: Dict[int, ModeSpec] = {
     10: ModeSpec(10, "non-public action (cat 00)",
                  "Spectrum-management action frame (category 0).", ("payload",)),
     11: ModeSpec(11, "beacon / probe-resp spoof",
-                 "Advertises a fake AP by spoofing beacons / probe responses for an SSID.",
-                 ("ssid",)),
+                 "Advertises a fake AP for an SSID. Needs no target — set a BSSID, "
+                 "or leave it blank to flood random BSSIDs. (With a target selected, "
+                 "it impersonates that AP instead.)",
+                 ("ssid", "fake")),
     12: ModeSpec(12, "custom hex frame",
                  "Transmits a raw 802.11 management frame you supply as hex.", ("hex",)),
 }

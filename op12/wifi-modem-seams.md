@@ -735,3 +735,161 @@ App integration: the Android-namespace harness for this (`apk/engine/mgmt_tx.py`
 APK) is tracked on branch `feature/mgmt-replace-arp`; see `apk/MGMT_PORT.md`.
 Roadmap there: build full mgmt-path support into DeadNet (selectable ARP vs
 mgmt emission backend).
+
+---
+
+## UNASSOCIATED INJECTION DOES NOT RADIATE — ROC gate found (2026-10-16)
+
+Overturns the earlier "implicit ROC confirmed / unassociated interface transmits"
+note (which rested on cookie + FRAME_TX_STATUS — i.e. accepted-for-TX, NOT on-air).
+First true **victim-based** A/B (owned ESP32 AP `08:d1:f9:e9:ed:41` ch6/2437 +
+associated MDM9607 victim `40:45:da:96:aa:37`, ping-from-inside-victim as sensor):
+- UNASSOCIATED phone, 12s targeted-deauth flood: victim ping loss **0%**
+  (canned repeating cookie 0x85c/0x861 = firmware fakes acceptance, drops frame).
+- SAME phone ASSOCIATED to that AP (real ch6 context): **77%** loss, sequential
+  cookies 0x880→ = real TX. Conclusion: mgmt-TX only radiates with channel context.
+
+ROC added to `op12/nl80211_inject.c` (env `ROC=1`, `ROC_MS<=2000`: driver caps
+duration at 2000, 3000+→EINVAL; no overlap, 2nd arm while active→EBUSY). It arms
+but is only intermittently honored → victim loss stayed 0-5%. Root cause traced
+in source:
+
+- cfg80211 `.remain_on_channel` → `__wlan_hdd_remain_on_channel`
+  (`qcacld-3.0/core/hdd/src/wlan_hdd_p2p.c:129`) → `wlan_is_scan_allowed(vdev)` →
+  `-EBUSY` when rejected. On this driver ROC rides the SCAN engine.
+- `wlan_is_scan_allowed` (`qca-wifi-host-cmn/os_if/linux/scan/src/wlan_cfg80211_scan.c:1444`)
+  rejects ("Simultaneous scan disabled, reject scan") iff ALL of:
+  (1) `!wlan_cfg80211_allow_simultaneous_scan(psoc)`,
+  (2) scan_req_q NOT empty  — an UNASSOCIATED phone's framework/PNO scans keep it busy,
+  (3) `opmode != QDF_SAP_MODE`.
+- (1) → `policy_mgr_is_scan_simultaneous_capable` (`wlan_policy_mgr_get_set_utils.c:11160`):
+  true only if HW is DBS-capable (it IS — `iw phy` shows `#channels <= 2`) AND
+  `dual_mac_feature` ∉ {4,5,6}. Value comes from INI
+  **`gDualMacFeatureDisable`** (`cfg_policy_mgr.h:360`, `CFG_INI_UINT(...,0,6,6)`,
+  **default 6 = DISABLE_DBS_CXN_AND_SCAN**) — on-device ini doesn't set it → uses 6.
+
+### TWO gates, in series — scan gate (opened) then PEER gate (the real wall)
+
+**Gate A — scan concurrency (OPENED, no rebuild).** `gDualMacFeatureDisable=0` in
+`WCNSS_qcom_cfg.ini` (Magisk module `op12_dualmac`, bind-mount overlay; /vendor is
+RO erofs) + reboot. 0 = ENABLE_DBS_CXN_AND_SCAN → `wlan_is_scan_allowed` passes
+even during framework scans. **Verified live: `reject scan` count 0 (was ~14-20),
+roc arm fails ~0.** HW is DBS-capable (`iw phy` `#channels<=2`). Reversible.
+Caveat: also enables DBS connections.
+
+**Gate B — PEER requirement (the actual blocker, needs qca_cld3 rebuild).** Even
+with ROC honored, unassociated TX still fails: dmesg `p2p_process_mgmt_tx: execute
+tx fail`. Root cause in `p2p_mgmt_tx()`
+(`qcacld-3.0/components/p2p/core/src/wlan_p2p_off_chan_tx.c:1197`): it looks up a
+**peer object** for the frame's addr1 (DA) then addr2 (SA); the only no-peer
+fallback is `if (opmode==QDF_NAN_DISC_MODE || tx_ctx->rand_mac_tx)` → self-peer,
+else `p2p_err("no valid peer"); return E_INVAL`. Unassociated + spoofed addrs =
+NO peer for either → fail. This is EXACTLY why associated injection works: when
+assoc'd to the ESP32, our deauth's SA = ESP32 BSSID = our connected AP = a **peer**
+→ TX proceeds (measured 77% victim loss); unassociated, nothing is a peer → 0%.
+`rand_mac_tx` only covers the vdev's OWN registered random MAC (`p2p_rand_mac_tx`
+@3090, needs `p2p_is_random_mac(SA)` or `!vdev_up` + `p2p_request_random_mac`
+success) — it canNOT carry an arbitrary spoofed-BSSID deauth, so it's not a usable
+no-rebuild escape for spoofed attacks.
+
+**CORRECTION to earlier belief:** "associate to any co-channel network" does NOT
+enable spoofed-BSSID injection — a *different* BSSID still isn't a peer. The frame's
+SA/DA must match a peer, i.e. you must be associated to the very AP you spoof (or
+patch Gate B).
+
+### The definitive lever: rebuild qca_cld3_kiwi_v2.ko (OnePlus vendor tree)
+Tree = `vendor/qcom/opensource/wlan/qcacld-3.0` (`kernel_platform/vendor` is a
+symlink → `../vendor`; single tree, branch `a15-wifi-monitor`). Device runs STOCK
+qca_cld3 (`vermagic …-gd0d07692e8eb`) + PATCHED cfg80211 (`…-maybe-dirty`). Two
+one-liner edits, same `if (0 && …)` style as the cfg80211 patch:
+- Gate B: in `p2p_mgmt_tx` make the no-peer fallback unconditional (always use
+  self-peer) — `if (1 || opmode==QDF_NAN_DISC_MODE || tx_ctx->rand_mac_tx)`.
+- Gate A (bake in so no INI needed): `wlan_is_scan_allowed()` → `return true;`.
+Build target already stood up (bazel built qca_cld3_kiwi_v2.ko from this tree,
+`out/bazel/.../pineapple_gki_qca_cld_kiwi-v2/`). Deliver into vendor_dlkm (same
+flash path as cfg80211; MANDATORY CRC gate; user-gated no-flash rule). ALSO still
+needs the firmware to actually radiate the off-channel frame with the self-peer —
+untested until the patched module is built; the ROC/scan-based off-chan path may
+still impose firmware limits.
+Dead ends re-confirmed: `iw set channel` on managed unassoc iface → EBUSY(-16);
+monitor vif → RX-only + drops STA.
+
+---
+
+## 2026-10-16 (session 2): two source audits + FOUR on-device disproofs — the rebuild plan above is NOT sufficient
+
+Ran two parallel source audits (TX code paths; INI/config+capability gates) then
+ground-truthed their most promising claims on the ESP32+modem rig. Net result: the
+optimistic "no-rebuild unassociated injection" levers are **all disproven on-device**,
+and the one-liner rebuild recipe above (`if (1 || …)` in p2p_mgmt_tx) is **wrong** —
+there is no self-peer to fall back on.
+
+### What the audits claimed (and why it was wrong)
+- **TX-paths audit — "STA self-peer" (LEVER 1, claimed no-rebuild TOP):** claimed an
+  unassociated STA has an objmgr self-peer keyed on its own MAC, created at vdev-CREATE
+  (`wma_dev_if.c:2868`, comment "self peer used for frames before association"), so
+  injecting with `addr2(SA)=own-MAC` — or MAC-cloning wlan0 to the victim BSSID — would
+  pass the peer gate. **DISPROVEN.** See below.
+- **INI/config audit — real but SAP-only levers:** `enable_bcast_deauth_for_sap=1`
+  (`cfg_mlme_sap.h:668`; one broadcast deauth → `lim_del_sta_all()` kicks all SAP
+  clients; PMF clients ignore it); `gRateForTxMgmt/2G/5G` (pin self-gen mgmt to a low
+  robust rate = range/reliability); `gNumVdevs=5`, `gMaxConcurrentActiveSessions=4`,
+  `gSoftApMaxPeers=64` (more concurrent guns / bigger SAP); Tier-2 channel knobs
+  (`gIgnoreCAC`, `gDisableDFSChSwitch`, `gSapAllowAllChannel`, SRD/5.9/indoor,
+  `coex_unsafe_chan_reg_disable`) — only pay off WITH a country override (FW regdb
+  clamps). **Ruled out:** NO INI defeats PMF (target-side property); `TxPower2g/5g`
+  already at max 30; scan-MAC randomization already on. OEM vendor subcmd
+  `OPLUS_NL80211_VENDOR_SUBCMD_SET_MAX_ASSOC` can raise SAP client cap from userspace.
+
+### On-device disproofs (ESP32-Test AP 08:d1:f9:e9:ed:41 ch6; victim modem 40:45:da:96:aa:37; ping-from-victim sensor)
+1. **Unassoc STA + spoofed SA** (SA=ESP32 BSSID): dmesg `p2p_populate_mac_header: no
+   valid peer`, victim 0%. (original finding, re-confirmed)
+2. **Unassoc STA + cloned MAC** = victim BSSID: MAC-clone only works with `svc wifi
+   disable` (driver rejects live; `RTNETLINK Invalid argument`), BUT the clone SURVIVES
+   `svc wifi enable` → radio live + unassoc + `iw` shows addr=cloned (scan returns 47
+   BSS). Fired ROC deauth with addr2 = cloned MAC = vdev MAC. Still `no valid peer`,
+   0%. **KEY:** `wlan_p2p_off_chan_tx.c:684` (`mac_addr=wh->i_addr2; peer=wlan_objmgr_get_peer`)
+   is UNCONDITIONAL and addr2 == the vdev's own MAC, yet returned NULL ⇒ **no objmgr
+   self-peer exists for an idle never-connected STA.** The self-peer is created at vdev
+   START (connect handshake), not create. Audit over-read it.
+3. **rand_mac_tx path** (`p2p_rand_mac_tx` @3090): even if it engaged (STA supports it,
+   `!is_vdev_up` true unassoc), its fallback at `:700`/`:1257` does
+   `mac_addr=wlan_vdev_mlme_get_macaddr(vdev); get_peer(...)` — same missing self-peer ⇒
+   can't help. (Also gated `!no_ack`; our `--fast` does NOT set DONT_WAIT_FOR_ACK, so
+   that wasn't the blocker — the missing peer is.)
+4. **SAP vdev self-BSSID inject** (user's "trick the card into hosting the target AP"):
+   `cmd wifi start-softap` → wlan2 AP vdev. Injecting deauth with addr2=SAP's-own-BSSID
+   **PASSES the gate** (NO "no valid peer" — a SAP vdev HAS a self/bss-peer at its BSSID,
+   unlike STA). BUT it does **NOT radiate**: moved modem onto our SAP (10.90.54.214),
+   deauth addr2=SAP-BSSID → victim 0%, canned cookies (0x100/0x101), same with ROC +
+   reason 2. Our CMD_FRAME routes through the P2P off-channel path which no-ops on an AP
+   vdev. AND the framework won't set an arbitrary SAP BSSID (`start-softap` has no bssid
+   arg, re-randomizes each start; `ip link set wlan2 address` destroys the SAP). Modem
+   can't sniff (iw phy: IBSS/managed only, no monitor).
+
+### Corrected conclusions
+- **The ONLY demonstrably-radiating deauth path on this chip is an ASSOCIATED STA**
+  (AP = real peer; lim/`wma_tx_packet` path TXes on the operating channel; measured 77%).
+  Good enough for OWN networks (associate legitimately, then attack co-clients).
+- **cfg80211 patch (live) does NOT help unassociated radiation** — it removed the
+  SA/subtype/address gates in `net/wireless/mlme.c`, but the qca_cld3 peer gate +
+  channel-context requirement sit BELOW it and still bite.
+- **The rebuild is bigger than a one-liner.** Flipping `if (1 || …)` in p2p_mgmt_tx is
+  useless because `wlan_vdev_mlme_get_macaddr(vdev)` has no peer to resolve. A working
+  rebuild must either CREATE a self-peer for the unassoc STA vdev, or drive the
+  peer-agnostic vdev-scoped WMI TX (`send_mgmt_cmd_tlv`, `wmi_unified_tlv.c:4756` carries
+  only vdev_id+chanfreq, no peer) directly — plus still provide channel context (ROC via
+  the scan gate, already opened by INI `gDualMacFeatureDisable=0`). Firmware acceptance
+  of a peer-less off-channel mgmt TX is UNPROVEN until built.
+- **Peer-less SAP templates DO radiate** (audit LEVER 5, untested here): beacon /
+  probe-resp via `wma_unified_bcn_tmpl_send` / `wmi_unified_probe_rsp_tmpl_send` are
+  vdev-scoped, no peer — rogue-AP/evil-twin content works. Deauth is NOT a template.
+
+### The real fork (recorded for next session)
+- **(A) Associate-then-attack** — works today, zero rebuild, fine for own nets.
+- **(B) Deep qca_cld3 rebuild** — create-peer or peer-agnostic WMI TX + ROC channel;
+  firmware radiation is the open risk. User approved a rebuild in principle; FLASHING
+  stays strictly user-gated.
+Device left clean: phone 76b35c06 STA MAC restored (f2:06:9f:aa:43:21), SAP stopped,
+SELinux permissive + op12_dualmac module still installed; modem e830926d back on
+ESP32-Test @ 192.168.4.2. ROC injector at /data/local/tmp/nli_roc.

@@ -1,0 +1,238 @@
+// nl80211_inject.c — minimal nl80211 management-frame injector (raw netlink, no libnl)
+//
+// Purpose: probe the WCN7850 (kiwi) mgmt-TX ceiling. Sends NL80211_CMD_FRAME with a
+// caller-supplied raw 802.11 management frame on a given interface + frequency, then
+// prints the kernel's reply (ACK, or the TX cookie / error). Pair with a sniffer to see
+// what actually hits the air and whether firmware rewrote seq/addr/etc.
+//
+// Build (host):
+//   $NDK/.../aarch64-linux-android31-clang -O2 -static-libgcc nl80211_inject.c -o nl80211_inject
+// Run (device, as root, SELinux permissive):
+//   ./nl80211_inject <ifname> <freq_mhz> [hexframe]
+//   e.g.  ./nl80211_inject wlan0 5745
+//         ./nl80211_inject wlan0 5745 d000...<hex>...
+//
+// Default frame = vendor-specific action (category 0x7f) with a locally-administered,
+// spoofed source and broadcast DA, carrying the ASCII tag "INJECTTEST" so you can grep
+// for it in a capture. Harmless: no peer state machine reacts to a vendor-specific action.
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <net/if.h>
+#include <sys/socket.h>
+#include <linux/netlink.h>
+#include <linux/genetlink.h>
+#include <linux/nl80211.h>
+
+#define BUFSZ 8192
+
+static int nl_fd;
+static unsigned int nl_seq = 0;
+static int mlme_mcast_grp = -1;   // id of nl80211 "mlme" multicast group (FRAME_TX_STATUS)
+
+// --- tiny netlink attribute helpers (all lengths NLA/NLMSG aligned) ---
+static void add_attr(struct nlmsghdr *nlh, int maxlen, int type,
+                     const void *data, int len) {
+    struct nlattr *na = (struct nlattr *)((char *)nlh + NLMSG_ALIGN(nlh->nlmsg_len));
+    int alen = NLA_HDRLEN + len;
+    na->nla_type = type;
+    na->nla_len = alen;
+    if (len) memcpy((char *)na + NLA_HDRLEN, data, len);
+    nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + NLA_ALIGN(alen);
+    (void)maxlen;
+}
+
+// Resolve a generic-netlink family id by name (e.g. "nl80211") via the genl controller.
+static int resolve_family(const char *name) {
+    char buf[BUFSZ];
+    memset(buf, 0, sizeof(buf));
+    struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+    nlh->nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN);
+    nlh->nlmsg_type = GENL_ID_CTRL;
+    nlh->nlmsg_flags = NLM_F_REQUEST;
+    nlh->nlmsg_seq = ++nl_seq;
+    nlh->nlmsg_pid = getpid();
+    struct genlmsghdr *gnlh = (struct genlmsghdr *)NLMSG_DATA(nlh);
+    gnlh->cmd = CTRL_CMD_GETFAMILY;
+    gnlh->version = 1;
+    add_attr(nlh, BUFSZ, CTRL_ATTR_FAMILY_NAME, name, strlen(name) + 1);
+
+    if (send(nl_fd, nlh, nlh->nlmsg_len, 0) < 0) { perror("send getfamily"); return -1; }
+
+    int rlen = recv(nl_fd, buf, sizeof(buf), 0);
+    if (rlen < 0) { perror("recv getfamily"); return -1; }
+
+    struct nlmsghdr *rh = (struct nlmsghdr *)buf;
+    if (rh->nlmsg_type == NLMSG_ERROR) { fprintf(stderr, "getfamily: NLMSG_ERROR\n"); return -1; }
+
+    struct nlattr *na = (struct nlattr *)((char *)NLMSG_DATA(rh) + GENL_HDRLEN);
+    int alen = rh->nlmsg_len - NLMSG_LENGTH(GENL_HDRLEN);
+    int famid = -1;
+    while (alen > 0) {
+        if (na->nla_type == CTRL_ATTR_FAMILY_ID)
+            famid = *(uint16_t *)((char *)na + NLA_HDRLEN);
+        else if (na->nla_type == CTRL_ATTR_MCAST_GROUPS) {
+            // nested array of groups; each a nested {GRP_NAME, GRP_ID}
+            struct nlattr *grp = (struct nlattr *)((char *)na + NLA_HDRLEN);
+            int glen = na->nla_len - NLA_HDRLEN;
+            while (glen > 0) {
+                struct nlattr *p = (struct nlattr *)((char *)grp + NLA_HDRLEN);
+                int plen = grp->nla_len - NLA_HDRLEN;
+                const char *gname = NULL; int gid = -1;
+                while (plen > 0) {
+                    if (p->nla_type == CTRL_ATTR_MCAST_GRP_NAME)
+                        gname = (const char *)p + NLA_HDRLEN;
+                    else if (p->nla_type == CTRL_ATTR_MCAST_GRP_ID)
+                        gid = *(uint32_t *)((char *)p + NLA_HDRLEN);
+                    int ps = NLA_ALIGN(p->nla_len);
+                    plen -= ps; p = (struct nlattr *)((char *)p + ps);
+                }
+                if (gname && !strcmp(gname, "mlme")) mlme_mcast_grp = gid;
+                int gs = NLA_ALIGN(grp->nla_len);
+                glen -= gs; grp = (struct nlattr *)((char *)grp + gs);
+            }
+        }
+        int step = NLA_ALIGN(na->nla_len);
+        alen -= step;
+        na = (struct nlattr *)((char *)na + step);
+    }
+    if (famid < 0) fprintf(stderr, "family id not found\n");
+    return famid;
+}
+
+static int hex2bin(const char *hex, unsigned char *out, int outmax) {
+    int n = 0;
+    while (hex[0] && hex[1]) {
+        if (hex[0] == ' ' || hex[0] == ':') { hex++; continue; }
+        if (n >= outmax) return -1;
+        unsigned v;
+        if (sscanf(hex, "%2x", &v) != 1) return -1;
+        out[n++] = (unsigned char)v;
+        hex += 2;
+    }
+    return n;
+}
+
+int main(int argc, char **argv) {
+    // --fast: fire-and-forget — exit on the TX ACK, do NOT wait for
+    // FRAME_TX_STATUS. Used by nuke mode for sustained-rate floods where
+    // the 40ms status wait would cap actual pps at ~25.
+    int fast = 0;
+    if (argc > 1 && strcmp(argv[1], "--fast") == 0) { fast = 1; argc--; argv++; }
+    const char *ifname = argc > 1 ? argv[1] : "wlan0";
+    unsigned int freq = argc > 2 ? (unsigned)atoi(argv[2]) : 5745;
+
+    // Default probe frame: vendor-specific action, spoofed SA, broadcast DA, tag "INJECTTEST".
+    unsigned char frame[1600];
+    int flen;
+    if (argc > 3) {
+        flen = hex2bin(argv[3], frame, sizeof(frame));
+        if (flen < 0) { fprintf(stderr, "bad hexframe\n"); return 2; }
+    } else {
+        unsigned char def[] = {
+            0xd0, 0x00,                         // FC: mgmt / action
+            0x00, 0x00,                         // duration
+            0xff,0xff,0xff,0xff,0xff,0xff,       // addr1 DA = broadcast
+            0x02,0x11,0x22,0x33,0x44,0x55,       // addr2 SA = spoofed (locally administered)
+            0x02,0x11,0x22,0x33,0x44,0x55,       // addr3 BSSID = spoofed
+            0x00, 0x00,                         // seq ctrl (fw expected to set)
+            0x7f,                               // action category = vendor specific
+            0xde,0xad,0xbe,                     // fake OUI
+            'I','N','J','E','C','T','T','E','S','T'
+        };
+        flen = sizeof(def);
+        memcpy(frame, def, flen);
+    }
+
+    unsigned int ifindex = if_nametoindex(ifname);
+    if (!ifindex) { fprintf(stderr, "no such iface %s\n", ifname); return 2; }
+
+    nl_fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
+    if (nl_fd < 0) { perror("socket"); return 1; }
+    struct sockaddr_nl local = {0};
+    local.nl_family = AF_NETLINK;
+    if (bind(nl_fd, (struct sockaddr *)&local, sizeof(local)) < 0) { perror("bind"); return 1; }
+
+    int fam = resolve_family("nl80211");
+    if (fam < 0) return 1;
+    printf("nl80211 family id = %d, ifindex(%s) = %u, freq = %u, frame_len = %d\n",
+           fam, ifname, ifindex, freq, flen);
+
+    // Join the "mlme" multicast group so we receive NL80211_CMD_FRAME_TX_STATUS.
+    if (mlme_mcast_grp >= 0) {
+        if (setsockopt(nl_fd, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP,
+                       &mlme_mcast_grp, sizeof(mlme_mcast_grp)) < 0)
+            perror("add mlme membership");
+    } else {
+        fprintf(stderr, "warning: mlme mcast group not found; TX status may not arrive\n");
+    }
+
+    // Build NL80211_CMD_FRAME
+    char buf[BUFSZ];
+    memset(buf, 0, sizeof(buf));
+    struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+    nlh->nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN);
+    nlh->nlmsg_type = fam;
+    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    nlh->nlmsg_seq = ++nl_seq;
+    nlh->nlmsg_pid = getpid();
+    struct genlmsghdr *gnlh = (struct genlmsghdr *)NLMSG_DATA(nlh);
+    gnlh->cmd = NL80211_CMD_FRAME;
+    gnlh->version = 0;
+
+    add_attr(nlh, BUFSZ, NL80211_ATTR_IFINDEX, &ifindex, sizeof(ifindex));
+    add_attr(nlh, BUFSZ, NL80211_ATTR_WIPHY_FREQ, &freq, sizeof(freq));
+    // Only request off-channel TX if asked (env OFFCHAN=1). On the operating
+    // channel it's unnecessary and the driver may reject it (expects a ROC).
+    if (getenv("OFFCHAN") && atoi(getenv("OFFCHAN")))
+        add_attr(nlh, BUFSZ, NL80211_ATTR_OFFCHANNEL_TX_OK, NULL, 0);
+    add_attr(nlh, BUFSZ, NL80211_ATTR_FRAME, frame, flen);
+
+    if (send(nl_fd, nlh, nlh->nlmsg_len, 0) < 0) { perror("send frame"); return 1; }
+
+    // 1st recv: synchronous reply (cookie) or NLMSG_ERROR.
+    int rlen = recv(nl_fd, buf, sizeof(buf), 0);
+    if (rlen < 0) { perror("recv"); return 1; }
+    struct nlmsghdr *rh = (struct nlmsghdr *)buf;
+    if (rh->nlmsg_type == NLMSG_ERROR) {
+        struct nlmsgerr *e = (struct nlmsgerr *)NLMSG_DATA(rh);
+        if (e->error == 0) { printf("RESULT: ACK (accepted)\n"); }
+        else { printf("RESULT: error %d (%s) — rejected before firmware\n",
+                      e->error, strerror(-e->error)); close(nl_fd); return 0; }
+    } else {
+        printf("RESULT: accepted for TX, cookie reply (type %d, len %d)\n", rh->nlmsg_type, rlen);
+    }
+
+    if (fast) { printf("TXSTATUS: --fast (skipped)\n"); close(nl_fd); return 0; }
+
+    // 2nd phase: wait up to 2s for NL80211_CMD_FRAME_TX_STATUS (the on-air / ACK signal).
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(nl_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    for (;;) {
+        rlen = recv(nl_fd, buf, sizeof(buf), 0);
+        if (rlen < 0) { printf("TXSTATUS: none within 2s (no status event delivered)\n"); break; }
+        struct nlmsghdr *h = (struct nlmsghdr *)buf;
+        if (h->nlmsg_type != fam) continue;              // not an nl80211 event
+        struct genlmsghdr *g = (struct genlmsghdr *)NLMSG_DATA(h);
+        if (g->cmd != NL80211_CMD_FRAME_TX_STATUS) continue;
+        // scan attrs for NL80211_ATTR_ACK (flag => acked by peer)
+        int acked = 0;
+        struct nlattr *na = (struct nlattr *)((char *)NLMSG_DATA(h) + GENL_HDRLEN);
+        int alen = h->nlmsg_len - NLMSG_LENGTH(GENL_HDRLEN);
+        while (alen > 0) {
+            if (na->nla_type == NL80211_ATTR_ACK) acked = 1;
+            int step = NLA_ALIGN(na->nla_len);
+            alen -= step;
+            na = (struct nlattr *)((char *)na + step);
+        }
+        printf("TXSTATUS: FRAME_TX_STATUS received — firmware transmitted the frame; ACK=%s\n",
+               acked ? "yes (peer acknowledged)" : "no (expected for broadcast/no-peer)");
+        break;
+    }
+    close(nl_fd);
+    return 0;
+}

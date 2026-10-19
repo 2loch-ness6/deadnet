@@ -50,7 +50,7 @@ _MODE_BY_LABEL = {ATTACK_CATALOG[i].label: i for i in _MODE_IDS}
 # per-knob UI metadata: key -> (caption, hint, int-only)
 _KNOB_META = {
     "cli":     ("target client MAC", "aa:bb:cc:dd:ee:ff", False),
-    "fake":    ("spoofed source",    "blank = 02:00:00:00:00:01", False),
+    "fake":    ("spoofed source / BSSID", "blank = auto (random for beacon flood)", False),
     "ssid":    ("SSID",              "network name (blank = target's)", False),
     "hex":     ("custom frame (hex)", "e.g. c0000000ffffffffffff...", False),
     "payload": ("payload (hex)",     "optional action body", False),
